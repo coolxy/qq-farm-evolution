@@ -52,8 +52,6 @@ const farmMin = intervalModel('farmMin')
 const farmMax = intervalModel('farmMax')
 const helpMin = intervalModel('helpMin')
 const helpMax = intervalModel('helpMax')
-const stealMin = intervalModel('stealMin')
-const stealMax = intervalModel('stealMax')
 
 function addPauseMinutes(minutes: number) {
   const current = Date.parse(settings.value.friendQuietHours.pauseUntil || '')
@@ -146,20 +144,9 @@ async function restartAccount() {
       />
     </div>
 
-    <div class="grid grid-cols-2 gap-3 md:grid-cols-2">
-      <BaseInput
-        v-model.number="stealMin"
-        label="偷菜巡查最小 (秒)"
-        type="number"
-        min="1"
-      />
-      <BaseInput
-        v-model.number="stealMax"
-        label="偷菜巡查最大 (秒)"
-        type="number"
-        min="1"
-      />
-    </div>
+    <p class="text-sm text-gray-500 dark:text-gray-400 leading-relaxed">
+      偷菜检查按好友作物成熟时间自动安排；暂无成熟时间时，约每5–8分钟重新发现。重点好友仍按在线状态和成熟时间检查。
+    </p>
 
     <div class="idle-rest-settings flex flex-wrap items-center gap-4 border-t pt-3 dark:border-gray-700">
       <BaseInput
@@ -183,13 +170,9 @@ async function restartAccount() {
         min="5"
         max="180"
       />
-      <BaseInput
-        v-model.number="settings.friendQuietHours.watchlistWakeBeforeMinutes"
-        label="重点好友盯梢窗口 (分钟)"
-        type="number"
-        min="5"
-        max="360"
-      />
+      <p class="w-full text-xs text-gray-500 dark:text-gray-400">
+        重点好友保留在线监控、成熟推送和到点布控；不再进行施肥趋势追踪。
+      </p>
       <p class="w-full text-xs text-gray-500 dark:text-gray-400">
         每次在你设置的最短与最长分钟数之间随机休息，没有额外的 10 分钟上限。
         若休息会跨入提前观察窗口，则缩短休息；不足最短时长时按正常节奏巡查。设置相同的最短和最长值可固定休息时长。

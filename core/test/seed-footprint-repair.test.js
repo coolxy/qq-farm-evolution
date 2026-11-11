@@ -76,18 +76,39 @@ test('unrelated entries and rare/golden meanings are preserved; reviewed default
   const plants = JSON.parse(fs.readFileSync(path.join(base, 'EventPlants.json'))); const items = JSON.parse(fs.readFileSync(path.join(base, 'EventItems.json')));
   const hash = x => crypto.createHash('sha256').update(JSON.stringify(x)).digest('hex');
   const selectedPlants = new Set([...cases.map(x => x[1]), 1020165, 1022254]); const selectedFruits = new Set(cases.map(x => x[2]));
+  // Separately covered by game-update-panel's actual catalog/plant/item behavior checks.
+  const novemberPlants = new Set([1020381, 1020397, 1020399, 1021080, 1021082, 1021096, 1021097, 1021099, 1021100, 1020374, 1020398, 1020457, 1020107, 1021084, 1021111, 1020117, 1020119, 1020173, 1020125, 1020189]);
+  const novemberItems = new Set([20381, 40381, 20397, 40397, 20399, 40399, 21080, 41080, 21082, 41082, 21096, 41096, 21097, 41097, 21099, 41099, 21100, 41100, 20374, 40374, 20398, 40398, 20457, 40457, 21084, 41084, 21111, 41111, 20117, 40117, 20119, 40119, 20173, 40173, 20125, 40125, 20189, 40189]);
   assert.equal(plants.filter(row => row.id === 1020165).length, 1);
   assert.deepEqual([config.getPlantBySeedId(20165)?.id, config.getPlantBySeedId(20165)?.size, config.getPlantBySeedId(20165)?.fruit.id], [1020165, 1, 40165]);
-  assert.equal(hash(plants.filter(x => !selectedPlants.has(x.id))), '74e6c25a895ffe9d969e1bdf17486181a82c1e9fbca3da295a36bc877d652a9d');
+  // Exact additions independently exercised by oil-tea-item-evidence.test.js;
+  // the historical unrelated-row hashes remain unchanged.
+  const oilTeaPlants = new Set([1020530]);
+  const oilTeaItems = new Set([20530, 40530, 1040529, 1040530]);
+  assert.equal(hash(plants.filter(x => !selectedPlants.has(x.id) && !novemberPlants.has(x.id) && !oilTeaPlants.has(x.id))), '74e6c25a895ffe9d969e1bdf17486181a82c1e9fbca3da295a36bc877d652a9d');
   // Preserve the original reviewed rows/hash while permitting the separately
   // verified reward additions, this one resolved image-provenance annotation,
   // and the separately verified golden-fruit rows asserted independently below.
-  const rewardAdditions = new Set([2163, 202011, 203012, 205011, 206011, 207012, 208012,
+  // Surprise gift packs are independently checked by activity-catalog-updates.
+  const rewardAdditions = new Set([101616, 101617, 2163, 202011, 203012, 205011, 206011, 207012, 208012,
     210031, 210032, 210033, 210034, 210035, 210036, 210037,
     210016, 210026, 210012, 210022, 210013, 210023, 210014, 210024, 210015, 210025, 210011, 210021, 210017, 210027, 210041, 210042, 210043, 401007, 210044, 210045, 210046, 210047]);
-  const goldenFruitAdditions = new Set([1040165, 1040526, 1049005, 1040528, 1042254, 1040527]);
+  const goldenFruitAdditions = new Set([1040165, 1040526, 1049005, 1040528, 1042254, 1040527, 1040021, 1041435]);
+  // 204011 is excluded from rewardAdditions on purpose: it is this round's separately
+  // verified milk-tea tower-skin decoration, asserted independently as type 18 below.
+  const decorationAdditions = new Set([204011]);
+  // Independently covered by the official type35 metadata, exact images and real zero-Sell bag regression.
+  const collectionAdditions = new Set([700001, 700002, 700003, 700004, 700005, 700006, 710001, 710002, 710003, 710004, 710005, 710006, 720001, 720002, 720003, 720004, 720005, 720006, 730001, 730002, 730003, 730004, 730005, 730006, 740001, 740002, 740003, 740004, 740005, 740006]);
+  // Real Bag classification and exact images are covered by season-seed-gift-packs.
+  const seedGiftPacks = new Set([101620, 101621, 101622, 101623]);
+  for (const id of seedGiftPacks) {
+    assert.equal(items.filter(x => x.id === id).length, 1);
+    assert.equal(config.getItemById(id).type, 11);
+    assert.equal(config.isSeedItem(id), false);
+    assert.equal(config.getPlantBySeedId(id), undefined);
+  }
   const originalItems = items.filter(x => ![22254, 42254].includes(x.id) && !selectedFruits.has(x.id) && !rewardAdditions.has(x.id)
-    && !goldenFruitAdditions.has(x.id))
+    && !goldenFruitAdditions.has(x.id) && !decorationAdditions.has(x.id) && !novemberItems.has(x.id) && !collectionAdditions.has(x.id) && !seedGiftPacks.has(x.id) && !oilTeaItems.has(x.id))
     .map(x => x.id !== 210048 ? x : { ...x, evidence: x.evidence.replace(
       '专属图按固定客户端提取快照核验，精确来源见seed_images_named/event-seed-sources.json',
       '专属图标暂缺官方资源证据，保留通用回退，不以其他道具图顶替',
@@ -95,13 +116,21 @@ test('unrelated entries and rare/golden meanings are preserved; reviewed default
   assert.equal(hash(originalItems), '4baaa0138392f234b1a06ca7dd2161537b8de7cdf9ce8932e5bd950fb072ebe6');
   // Reviewed golden fruits: registered exactly once as type-17 fruits, never as seeds
   // or Plants — the size-2 source plant behind 1049005 does not turn its fruit into a seed.
-  for (const [id, name] of [[1040165, '黄金·茱萸'], [1040526, '黄金·森野白桃'], [1049005, '黄金·森野黄金芽'], [1040528, '黄金·森野红柚'], [1042254, '黄金·天山红枫'], [1040527, '黄金·森野甜橙']]) {
+  for (const [id, name] of [[1040165, '黄金·茱萸'], [1040526, '黄金·森野白桃'], [1049005, '黄金·森野黄金芽'], [1040528, '黄金·森野红柚'], [1042254, '黄金·天山红枫'], [1040527, '黄金·森野甜橙'], [1040021, '黄金·森野可可豆'], [1041435, '黄金·森野柿子']]) {
     const rows = items.filter(x => x.id === id);
     assert.equal(rows.length, 1, `${id} must be registered exactly once`);
     assert.equal(rows[0].name, name); assert.equal(rows[0].type, 17);
     assert.equal(config.getPlantByFruitId(id), undefined); assert.equal(config.getPlantBySeedId(id), undefined);
     assert.equal(config.isSeedItem(id), false);
   }
+  // Separately verified 204011: a type-18 decoration with no Plant mapping —
+  // its direct coin price must never grant seed or automatic-sale semantics.
+  const decorationRows = items.filter(x => x.id === 204011);
+  assert.equal(decorationRows.length, 1, '204011 must be registered exactly once');
+  assert.equal(decorationRows[0].name, '金露云酪'); assert.equal(decorationRows[0].type, 18);
+  assert.equal(decorationRows[0].sells, '1001:1000000');
+  assert.equal(config.getPlantBySeedId(204011), undefined); assert.equal(config.getPlantByFruitId(204011), undefined);
+  assert.equal(config.isSeedItem(204011), false);
   for (const [seed, plant] of cases) assert.equal(plants.find(x => x.id === plant && x.seed_id === seed)?.size, 1);
   assert.equal(config.getPlantBySeedId(29005).size, 2); assert.equal(config.getPlantBySeedId(29004).size, 2);
   assert.equal(config.getPlantByFruitId(1040525), undefined, 'golden fruit does not become a seed-bearing Plant');

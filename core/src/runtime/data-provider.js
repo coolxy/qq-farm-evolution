@@ -4,6 +4,7 @@ const {
     resolveAccountId: resolveAccountIdByList
 } = require('../services/account-resolver');
 const { getSchedulerRegistrySnapshot } = require('../services/scheduler');
+const { bindingIdentity } = require('./session-registry');
 
 /**
  * 创建数据提供器 —— 封装对 Worker 的 API 调用，供 Admin Server 使用
@@ -54,6 +55,8 @@ function createDataProvider(deps) {
     const FRIEND_TIMEOUT = { _timeoutMs: 180000 };       // 3分钟
     const SYNC_TIMEOUT = { _timeoutMs: 180000 };          // 3分钟
     const DOG_INFO_TIMEOUT = { _timeoutMs: 600000 };     // 10分钟
+    const panelWorkerIds = new WeakMap();
+    let panelWorkerSequence = 0;
 
     function persistClearedLogs(previousRuntime, previousAccounts) {
         if (!deps.persistLogHistory) return;
@@ -64,6 +67,17 @@ function createDataProvider(deps) {
     }
 
     return {
+        getGamePanelReadScope: (ref) => {
+            const id = resolveAccountId(ref), account = findAccount(id), worker = workers[id];
+            if (!account || !worker || worker.status?.connection?.connected !== true) throw new Error('账号连接状态未知');
+            if (!panelWorkerIds.has(worker)) panelWorkerIds.set(worker, ++panelWorkerSequence);
+            const facts = worker.process?.sessionFacts;
+            if (worker.process?.persistentSession && (facts?.game?.connected !== true || facts?.business?.ready !== true)) throw new Error('账号业务尚未就绪');
+            return JSON.stringify([id, bindingIdentity(account), panelWorkerIds.get(worker),
+                facts?.host?.hostId || '', facts?.game?.connectionEpoch || '', facts?.game?.loginEpoch || '', facts?.business?.epoch || '']);
+        },
+        getDogReadPanel: (ref) => callWorkerApi(resolveAccountId(ref), 'getDogReadPanel'),
+        getCollectionReadPanel: (ref) => callWorkerApi(resolveAccountId(ref), 'getCollectionReadPanel'),
         prepareWxRestart: deps.prepareWxRestart,
         validateWxRestart: deps.validateWxRestart,
         cancelWxRestart: deps.cancelWxRestart,
@@ -171,7 +185,14 @@ function createDataProvider(deps) {
         removePlant: (ref, landId) => callWorkerApi(resolveAccountId(ref), 'removePlant', landId),
         removeAllPlants: (ref) => callWorkerApi(resolveAccountId(ref), 'removeAllPlants'),
         getShopInfo: (ref, shopId) => callWorkerApi(resolveAccountId(ref), 'getShopInfo', shopId),
-        buyGoods: (ref, shopId, goodsId, count) => callWorkerApi(resolveAccountId(ref), 'buyGoods', shopId, goodsId, count),
+        // 面板手动购买：携带 confirmed 报价快照走唯一写守护（对象载荷）；
+        // 旧图鉴链路的 (goodsId, num, price) 三元组继续原样透传。
+        buyGoods: (ref, shopId, goodsId, count) => {
+            if (shopId && typeof shopId === 'object' && !Array.isArray(shopId)) {
+                return callWorkerApi(resolveAccountId(ref), 'buyGoods', shopId);
+            }
+            return callWorkerApi(resolveAccountId(ref), 'buyGoods', shopId, goodsId, count);
+        },
         doAnalytics: (ref, days) => callWorkerApi(resolveAccountId(ref), 'getAnalytics', days),
 
         // ========== Friend API ==========
@@ -193,14 +214,28 @@ function createDataProvider(deps) {
 
         // ========== 仓库 ==========
         useItem: (ref, itemId, count, uid) => callWorkerApi(resolveAccountId(ref), 'useItem', itemId, count, uid),
-        sellItems: (ref, items) => callWorkerApi(resolveAccountId(ref), 'sellItems', items),
+        // 面板手动出售（对象载荷 {items, prices, quoteFingerprint, explicitBatch}）
+        // 走唯一写守护；旧数组载荷继续原样透传。
+        sellItems: (ref, items) => {
+            if (items && !Array.isArray(items) && typeof items === 'object') {
+                return callWorkerApi(resolveAccountId(ref), 'sellItems', items);
+            }
+            return callWorkerApi(resolveAccountId(ref), 'sellItems', items);
+        },
 
         // ========== 每日礼包 ==========
         getDailyGifts: (ref) => callWorkerApi(resolveAccountId(ref), 'getDailyGiftOverview'),
 
         // ========== Mall ==========
         getMallGoods: (ref) => callWorkerApi(resolveAccountId(ref), 'getMallGoods'),
-        buyMallGoods: (ref, goodsId, count) => callWorkerApi(resolveAccountId(ref), 'buyMallGoods', goodsId, count),
+        getMallCatalog: (ref) => callWorkerApi(resolveAccountId(ref), 'getMallCatalog'),
+        getMonthCardPanel: (ref) => callWorkerApi(resolveAccountId(ref), 'getMonthCardPanel'),
+        buyMallGoods: (ref, goodsId, count) => {
+            if (goodsId && typeof goodsId === 'object' && !Array.isArray(goodsId)) {
+                return callWorkerApi(resolveAccountId(ref), 'buyMallGoods', goodsId);
+            }
+            return callWorkerApi(resolveAccountId(ref), 'buyMallGoods', goodsId, count);
+        },
         getMysteryShop: (ref) => callWorkerApi(resolveAccountId(ref), 'getMysteryShop'),
         buyMysteryShopGoods: (ref, npcId) => callWorkerApi(resolveAccountId(ref), 'buyMysteryShopGoods', npcId),
         abandonMysteryShop: (ref) => callWorkerApi(resolveAccountId(ref), 'abandonMysteryShop'),
@@ -208,6 +243,9 @@ function createDataProvider(deps) {
         // ========== Activity ==========
         getActivityDiscoveryList: (ref) => callWorkerApi(resolveAccountId(ref), 'getActivityDiscoveryList'),
         getOfficialAnnouncements: (ref) => callWorkerApi(resolveAccountId(ref), 'getOfficialAnnouncements'),
+        // 只读双箱邮件快照与一次有界更新证据采集（Worker 侧 60s 缓存共享）
+        getEmailSnapshot: (ref, options) => callWorkerApi(resolveAccountId(ref), 'getEmailSnapshot', options || {}, { _timeoutMs: 30000 }),
+        getGameUpdateEvidence: (ref, options) => callWorkerApi(resolveAccountId(ref), 'getGameUpdateEvidence', options || {}, { _timeoutMs: 120000 }),
         getActivityGroupSnapshot: (ref, activityId, uid = '') => callWorkerApi(resolveAccountId(ref), 'getActivityGroupSnapshot', activityId, uid),
         // 奶茶热销中（S4）：默认只读快照 + 显式查询 + 面板手动操作
         getMilkTeaActivity: (ref) => callWorkerApi(resolveAccountId(ref), 'getMilkTeaActivity'),
@@ -308,12 +346,64 @@ function createDataProvider(deps) {
             return { autoCodeRefresh: data };
         },
 
+        recoverAccountConnection: async (ref) => {
+            const id = resolveAccountId(ref);
+            const account = findAccount(id || ref);
+            if (!account) return { state: 'missing' };
+            const stamp = value => JSON.stringify([value ? require('./session-registry').bindingIdentity(value) : '',
+                value?.ownerId, value?.userId, value?.uin, value?.openId, value?.credentialGeneration, value?.autoLogin]);
+            const captured = stamp(account);
+            const isCurrent = () => stamp(findAccount(id || ref)) === captured;
+            const legacy = workers[id];
+            if (legacy && !legacy.process?.persistentSession) {
+                const legacyProcess = legacy.process;
+                if (legacy.stopping || !legacyProcess || typeof callWorkerApi !== 'function') return { state: 'unknown' };
+                let local;
+                try { local = await callWorkerApi(id, 'getLocalConnectionState'); }
+                catch { return { state: 'unknown' }; }
+                if (!isCurrent() || workers[id] !== legacy || legacy.process !== legacyProcess || legacy.stopping)
+                    return { state: 'cancelled' };
+                if (local?.state === 'online' && local.connected === true)
+                    return local.businessReady === true ? { state: 'restored', connected: true, businessReady: true }
+                        : { state: 'unhealthy', connected: true };
+                if (local?.state === 'offline' && local.connected === false) return { state: 'offline', connected: false };
+                return { state: 'unknown' };
+            }
+            if (typeof deps.tryAdoptAccountSession !== 'function') return { state: 'unknown' };
+            let result;
+            try { result = await deps.tryAdoptAccountSession(account, { connectedOnly: true, isCurrent }); }
+            catch { return { state: 'unknown' }; }
+            if (!isCurrent()) return { state: 'cancelled' };
+            if (result?.state === 'adopted') {
+                const facts = result.facts;
+                const current = workers[id];
+                const live = current?.process?.sessionFacts;
+                if (!current || current.stopping || !current.process?.persistentSession
+                    || current.process.businessInitialized !== true || !live?.host || !facts?.host)
+                    return { state: 'cancelled' };
+                const knownFault = current.process.businessFaultEpoch;
+                if (live.game?.connected !== true || live.game.terminal === true || live.business?.ready !== true
+                    || (knownFault && knownFault === live.business.epoch))
+                    return { state: 'unhealthy', connected: live.game?.connected === true };
+                const identity = value => JSON.stringify([value.host.hostId, value.host.pid, value.host.starttime,
+                    value.game?.connectionEpoch, value.game?.loginEpoch,
+                    value.business?.epoch, value.business?.commit, value.business?.sourceFingerprint]);
+                if (identity(live) !== identity(facts)) return { state: 'cancelled' };
+                if (facts.game?.connected === true && facts.game.terminal !== true && facts.business?.ready === true)
+                    return { state: 'restored', connected: true, businessReady: true };
+                return { state: 'unhealthy', connected: live.game?.connected === true };
+            }
+            if (['absent', 'offline'].includes(result?.state)) return { state: 'offline', connected: false };
+            return { state: ['disabled', 'cancelled', 'unhealthy'].includes(result?.state) ? result.state : 'unknown',
+                ...(result?.facts?.game?.connected === true ? { connected: true } : {}) };
+        },
+
         refreshAccountCode: async (ref, reason) => {
             const id = resolveAccountId(ref);
             if (!id) throw new Error('Missing x-account-id');
             if (typeof refreshAccountCode !== 'function') throw new Error('自动刷新服务不可用');
             const ok = await refreshAccountCode(id, reason || 'manual');
-            return { ok };
+            return { ok, ...(!ok && typeof needsWxRescan === 'function' && needsWxRescan(id) === true ? { needScan: true } : {}) };
         },
 
         // 自助扫码「授权已保存但换码/启动未收口」时的自动恢复排程：沿既有

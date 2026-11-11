@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { getLandPresentation } from '@/utils/land-presentation'
 
 const props = withDefaults(defineProps<{
   land: any
@@ -103,56 +104,27 @@ const isRemovable = computed(() =>
 const canFertilize = computed(() => props.showActions && isFertilizable.value)
 const canRemove = computed(() => props.showActions && isRemovable.value)
 
-const landTextureName = computed(() => {
-  const targetLand = land.value || {}
-  const level = Math.min(5, Math.max(1, Number(targetLand.level) || 1))
-  const isSnow = Boolean(
-    targetLand.isSnow
-    || targetLand.snow
-    || targetLand.snowy
-    || String(targetLand.weather || '').toLowerCase() === 'snow',
-  )
-
-  if (targetLand.status === 'locked')
-    return isSnow ? 'land_locked_snow' : 'land_locked'
-
-  if (targetLand.needWater) {
-    if (level === 1 && isSnow)
-      return 'land_dry1_snow'
-    return `land_dry${level}`
-  }
-
-  if (level === 1 && isSnow)
-    return 'land_valid1_snow'
-  return `land_valid${level}`
-})
-
-const landTextureUrl = computed(() => {
-  if (Number(land.value?.plantSize) > 1)
-    return `/game-config/land_images/land_valid${Math.min(5, Math.max(1, Number(land.value?.level) || 1))}_2x2.png`
-  return `/game-config/land_images/${landTextureName.value}.png`
-})
-
-const shouldRotateLandTexture = computed(() => {
-  const level = Number(land.value?.level) || 1
-  return level === 5
-})
+const landPresentation = computed(() => getLandPresentation(land.value))
+const landTextureUrl = computed(() => landPresentation.value.textureUrl)
+const shouldRotateLandTexture = computed(() => landPresentation.value.rotate)
 
 const mutantEffects = computed(() => {
   const effects = Array.isArray(land.value?.mutantEffects) ? land.value.mutantEffects : []
   return effects
     .map((effect: any) => {
-      const icon = String(effect?.icon || '').trim()
+      const id = Number(effect?.id) || 0
+      const icon = id === 18 ? '' : String(effect?.icon || '').trim()
       return {
-        id: Number(effect?.id) || 0,
-        name: String(effect?.name || effect?.effect_name || icon || '变异').trim(),
+        id,
+        name: id === 18 ? '藏品' : String(effect?.name || effect?.effect_name || icon || '变异').trim(),
         icon,
         image: icon ? `/game-config/seed_images_named/mutant/${icon}.png` : '',
         tag: String(effect?.tag || '').trim(),
         description: String(effect?.description || effect?.desc || effect?.tips || '').trim(),
+        textOnly: effect?.display_kind === 'text',
       }
     })
-    .filter((effect: any) => effect.icon)
+    .filter((effect: any) => effect.icon || effect.textOnly)
 })
 
 const hasGoldenMutation = computed(() => mutantEffects.value.some((effect: any) =>
@@ -180,12 +152,11 @@ const cropImageUrl = computed(() => {
 
 function getLandStatusClass(targetLand: any) {
   const status = targetLand.status
-  const level = Number(targetLand.level) || 0
 
   if (status === 'locked')
     return 'land-level-locked bg-slate-50/90 dark:bg-slate-900/80 border-slate-300 dark:border-slate-700 border-dashed'
 
-  const baseClass = `land-level-${Math.min(5, Math.max(1, level || 1))} bg-stone-50/90 dark:bg-stone-950/80 border-stone-300 dark:border-stone-700`
+  const baseClass = `${getLandPresentation(targetLand).className} bg-stone-50/90 dark:bg-stone-950/80 border-stone-300 dark:border-stone-700`
 
   if (status === 'dead')
     return 'bg-gray-200 dark:bg-gray-700 border-gray-300 dark:border-gray-600 grayscale'
@@ -320,6 +291,7 @@ function getIsometricBubbleClass(targetLand: any) {
         'land-isometric': isometric,
         'land-isometric-size-2': isometric && Number(land.plantSize) > 1,
         'land-card-selected': selected,
+        'ring-1 ring-sky-500 dark:ring-sky-300': Number(land.level) === 6,
       },
     ]"
     :style="getFarmGridStyle(land)"
@@ -345,6 +317,7 @@ function getIsometricBubbleClass(targetLand: any) {
     >
       <img
         :src="landTextureUrl"
+        :style="{ filter: landPresentation.filter }"
         alt=""
         :class="[
           Number(land.plantSize) > 1 ? 'land-ground-merged' : 'land-ground-single',
@@ -354,7 +327,7 @@ function getIsometricBubbleClass(targetLand: any) {
     </div>
 
     <div class="land-card-id absolute left-1 top-1 text-[10px] text-gray-400 font-mono">
-      #{{ land.id }}
+      #{{ land.id }} · {{ landPresentation.label }}
     </div>
 
     <div
@@ -374,15 +347,14 @@ function getIsometricBubbleClass(targetLand: any) {
       v-if="mutantEffects.length > 0"
       class="land-mutant-effects absolute left-1 top-5 flex flex-col gap-1"
     >
-      <img
-        v-for="effect in mutantEffects"
-        :key="`${land.id}-${effect.id}-${effect.icon}`"
-        :src="effect.image"
-        :alt="effect.name"
-        :title="effect.tag && effect.tag !== '无' ? `${effect.name} · ${effect.tag}` : effect.name"
-        class="h-4 w-4 rounded-sm object-contain drop-shadow-sm"
-        loading="lazy"
-      >
+      <template v-for="effect in mutantEffects" :key="`${land.id}-${effect.id}-${effect.icon}`">
+        <img
+          v-if="effect.image" :src="effect.image" :alt="effect.name"
+          :title="effect.tag && effect.tag !== '无' ? `${effect.name} · ${effect.tag}` : effect.name"
+          class="h-4 w-4 rounded-sm object-contain drop-shadow-sm" loading="lazy"
+        >
+        <span v-else class="rounded bg-violet-100 px-1 text-[9px] text-violet-800 dark:bg-violet-950 dark:text-violet-200" :title="effect.description">{{ effect.name }}</span>
+      </template>
     </div>
 
     <div
@@ -562,7 +534,7 @@ function getIsometricBubbleClass(targetLand: any) {
               :key="`bubble-${land.id}-${effect.id}-${effect.icon}`"
               class="inline-flex items-center gap-1 rounded-full bg-white px-2 py-1 text-[11px] text-pink-700 shadow-sm dark:bg-gray-900 dark:text-pink-200"
             >
-              <img :src="effect.image" :alt="effect.name" class="h-4 w-4 object-contain">
+              <img v-if="effect.image" :src="effect.image" :alt="effect.name" class="h-4 w-4 object-contain">
               <span class="font-medium">{{ effect.name }}</span>
               <span v-if="effect.tag && effect.tag !== '无'" class="text-[10px] text-pink-400">· {{ effect.tag }}</span>
             </div>
@@ -1446,4 +1418,9 @@ function getIsometricBubbleClass(targetLand: any) {
 :global(.dark) .land-level-black .land-action-button {
   background: rgba(255, 255, 255, 0.9);
 }
+</style>
+
+<style scoped>
+.land-level-6 { border-color: #38bdf8; background-color: #e0f2fe; }
+:global(.dark) .land-level-6 { background-color: #082f49; border-color: #38bdf8; }
 </style>

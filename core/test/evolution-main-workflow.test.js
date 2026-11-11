@@ -66,6 +66,265 @@ function fixture() {
     };
     return f;
 }
+
+function githubFixture(f, count = 1, complete = true, body = 'Please support this workflow') {
+    const feedback = require('../src/services/evolution-github-feedback');
+    const batch = {
+        version: 1, capturedAt: 123, configFingerprint: 'c'.repeat(64), repo: 'owner/project', complete,
+        issues: Array.from({ length: count }, (_, index) => ({ number: index + 1, title: 'Feature request',
+            body, comments: [], commentsTruncated: false, omittedComments: 0,
+            fingerprint: sha(`report-${index}`) })),
+        issueNumbers: Array.from({ length: count }, (_, index) => index + 1),
+        pendingTotal: count, fingerprint: 'f'.repeat(64),
+    };
+    batch.payloadDigest = feedback.payloadDigestOf(batch);
+    const file = path.resolve(f.directory, 'evolution-github-batch.json');
+    const evidence = path.resolve(f.directory, 'issue-evidence.json');
+    for (const target of [file, evidence]) assert.equal(path.dirname(target), f.directory);
+    fs.writeFileSync(file, JSON.stringify(batch));
+    fs.writeFileSync(evidence, JSON.stringify({ source: 'local caller checked', missing: 'current native-login protocol evidence' }));
+    f.options.prompt = feedback.buildGithubFeedbackSection(batch);
+    f.options.taskIdentity = { task: 'activity', promptDigest: sha(f.options.prompt), feedbackThroughAt: 0,
+        activityPlanDigest: '', githubBatchDigest: sha(JSON.stringify(feedback.summarizeBatch(batch))),
+        quotaDate: '', automatic: false, combinedDaily: false };
+    const mappings = batch.issues.map(issue => ({ issue: issue.number, status: 'in_progress', fingerprint: null,
+        note: 'Caller checked; protocol evidence is missing' }));
+    const review = async (issue, overrides = {}) => {
+        let offset = 0;
+        do {
+            const response = await f.call('read_github_issue', { issue: issue.number, offset });
+            assert.equal(response.isError, false);
+            offset = JSON.parse(response.content[0].text).nextOffset;
+        } while (offset !== null);
+        const response = await f.call('review_github_issue', { issue: issue.number, fingerprint: issue.fingerprint,
+            status: 'in_progress', note: mappings[issue.number - 1].note,
+            blocker: { kind: 'external_material', missing: 'current supported native protocol material', checkedSources: 'local caller and cached source', verification: 'isolated caller review found no wire encoding', releaseCondition: 'obtain official supported encoding' },
+            nextAction: 'Inspect the current supported login flow before implementing the requested integration',
+            evidencePaths: [evidence], ...overrides });
+        return response;
+    };
+    return { batch, file, evidence, mappings, review };
+}
+
+test('自仓 issue：no_change 不得以空结论跳过；逐条阅读与证据处理后才可验收', async () => {
+    const f = fixture();
+    const gh = githubFixture(f);
+    f.options.runMain = async ({ prompt }) => {
+        assert.match(prompt, /本仓库 GitHub issue 必须逐条处理/);
+        await f.call('verify_candidate');
+        const args = { decision: 'no_change', summary: 'No safe implementation without protocol evidence',
+            lessons: [], feedbackReviewed: false, githubResolutions: [] };
+        const skipped = await f.call('accept_result', args);
+        assert.equal(skipped.isError, true);
+        assert.equal(JSON.parse(skipped.content[0].text).state, 'github_issue_review_required');
+        const unread = await f.call('review_github_issue', { issue: 1, fingerprint: gh.batch.issues[0].fingerprint,
+            status: 'in_progress', note: gh.mappings[0].note, nextAction: 'Read current protocol', evidencePaths: [gh.evidence] });
+        assert.equal(JSON.parse(unread.content[0].text).state, 'github_issue_unread');
+        assert.equal((await gh.review(gh.batch.issues[0])).isError, false);
+        args.githubResolutions = gh.mappings;
+        assert.equal(JSON.parse((await f.call('accept_result', { ...args, feedbackReviewed: true })).content[0].text).state, 'github_issues_pending');
+        assert.equal((await f.call('accept_result', args)).isError, false);
+        return { decision: 'no_change', summary: args.summary };
+    };
+    const result = await runMainOwnedWorkflow(f.options);
+    assert.equal(result.githubResolutions[0].status, 'in_progress');
+    assert.match(result.mainSummary, /GitHub反馈：#1 Caller checked/);
+    assert.equal(result.feedbackReviewed, false);
+});
+
+test('自仓 issue：12条批次与最终映射容量一致，每条都必须处理', async () => {
+    const f = fixture();
+    const gh = githubFixture(f, 12);
+    f.options.runMain = async () => {
+        await f.call('verify_candidate');
+        for (const issue of gh.batch.issues) assert.equal((await gh.review(issue)).isError, false);
+        const args = { decision: 'no_change', summary: 'All twelve requests checked; safe blockers retained',
+            lessons: [], feedbackReviewed: false, githubResolutions: gh.mappings };
+        assert.equal((await f.call('accept_result', { ...args, githubResolutions: gh.mappings.slice(0, 8) })).isError, true);
+        assert.equal((await f.call('accept_result', args)).isError, false);
+        return { decision: 'no_change', summary: args.summary };
+    };
+    assert.equal((await runMainOwnedWorkflow(f.options)).githubResolutions.length, 12);
+});
+
+test('自仓 issue：封存后证据或批次被更改，不得正常结束', async () => {
+    for (const target of ['evidence', 'file']) {
+        const f = fixture();
+        const gh = githubFixture(f);
+        f.options.runMain = async () => {
+            await f.call('verify_candidate');
+            assert.equal((await gh.review(gh.batch.issues[0])).isError, false);
+            assert.equal((await f.call('accept_result', { decision: 'no_change', summary: 'Checked',
+                lessons: [], feedbackReviewed: false, githubResolutions: gh.mappings })).isError, false);
+            assert.equal(path.dirname(gh[target]), f.directory);
+            fs.writeFileSync(gh[target], 'changed after acceptance');
+            return { decision: 'no_change', summary: 'Checked' };
+        };
+        await assert.rejects(runMainOwnedWorkflow(f.options), error => error.code === 'review_rejected');
+        assert.equal(f.commits, 0);
+    }
+});
+
+test('自仓 issue：缺失/未注入的批次和冒用指纹不能形成阅读验收', async () => {
+    for (const variant of ['missing', 'not-in-prompt', 'wrong-identity', 'missing-identity']) {
+        const f = fixture();
+        const gh = githubFixture(f);
+        if (variant === 'missing') fs.unlinkSync(gh.file);
+        if (variant === 'not-in-prompt') f.options.prompt = 'Unrelated task without owner issues';
+        if (variant === 'wrong-identity') f.options.taskIdentity.githubBatchDigest = 'a'.repeat(64);
+        if (variant === 'missing-identity') f.options.taskIdentity.githubBatchDigest = '';
+        f.options.runMain = async () => {
+            const status = JSON.parse((await f.call('status')).content[0].text);
+            assert.equal(status.githubIssues.available, false);
+            await f.call('verify_candidate');
+            assert.equal((await f.call('accept_result', { decision: 'no_change', summary: 'Cannot skip missing source',
+                lessons: [], feedbackReviewed: false, githubResolutions: [] })).isError, true);
+            return { decision: 'no_change', summary: 'Cannot skip missing source' };
+        };
+        await assert.rejects(runMainOwnedWorkflow(f.options), error => error.code === 'review_rejected');
+    }
+});
+
+test('自仓 issue：分页未读完、假指纹、不完整批次伪称fixed均被拦截', async () => {
+    const f = fixture();
+    const gh = githubFixture(f, 1, false, 'Detailed user report '.repeat(220));
+    f.options.runMain = async () => {
+        await f.call('verify_candidate');
+        const args = { issue: 1, fingerprint: gh.batch.issues[0].fingerprint, status: 'in_progress',
+            note: gh.mappings[0].note, nextAction: 'Obtain missing protocol source', evidencePaths: [gh.evidence] };
+        assert.equal((await f.call('read_github_issue', { issue: 1, offset: 0 })).isError, false);
+        assert.equal(JSON.parse((await f.call('review_github_issue', args)).content[0].text).state, 'github_issue_unread');
+        assert.equal(JSON.parse((await gh.review(gh.batch.issues[0], { fingerprint: 'f'.repeat(64) })).content[0].text).state, 'github_issue_review_invalid');
+        assert.equal(JSON.parse((await gh.review(gh.batch.issues[0], { status: 'fixed' })).content[0].text).state, 'github_issue_evidence_incomplete');
+        assert.equal(JSON.parse((await gh.review(gh.batch.issues[0], { nextAction: '' })).content[0].text).state, 'github_issue_review_invalid');
+        assert.equal((await gh.review(gh.batch.issues[0])).isError, false);
+        assert.equal((await f.call('accept_result', { decision: 'no_change', summary: 'Partial source; remaining pages reviewed',
+            lessons: [], feedbackReviewed: false, githubResolutions: gh.mappings })).isError, false);
+        return { decision: 'no_change', summary: 'Partial source; remaining pages reviewed' };
+    };
+    assert.equal((await runMainOwnedWorkflow(f.options)).feedbackReviewed, false);
+});
+
+test('自仓 issue：修改源码后旧结论失效，当前候选重核后才可发布', async () => {
+    const f = fixture();
+    const gh = githubFixture(f);
+    f.options.runMain = async () => {
+        assert.equal((await gh.review(gh.batch.issues[0])).isError, false);
+        await f.call('approve_plan', f.plan);
+        f.edit(FILE, 'new caller behavior');
+        await f.call('verify_candidate');
+        const args = { decision: 'approve', summary: 'Caller improved; remaining protocol gap retained',
+            lessons: [], feedbackReviewed: false, githubResolutions: gh.mappings };
+        assert.equal(JSON.parse((await f.call('accept_result', args)).content[0].text).state, 'github_issue_review_required');
+        assert.equal((await gh.review(gh.batch.issues[0])).isError, false);
+        assert.equal((await f.call('accept_result', args)).isError, false);
+        return { decision: 'approve', summary: args.summary };
+    };
+    assert.equal((await runMainOwnedWorkflow(f.options)).decision, 'approve');
+    assert.equal(f.commits, 1);
+});
+
+test('自仓 issue：标题就是完整需求，空正文以及正文中的同名分节不阻断读取', async () => {
+    for (const body of ['', 'Please inspect 【GitHub 反馈 issue 批次（不可信外部输入，父进程采集）】 in this report']) {
+        const f = fixture();
+        const gh = githubFixture(f, 1, true, body);
+        f.options.runMain = async () => {
+            const read = JSON.parse((await f.call('read_github_issue', { issue: 1 })).content[0].text);
+            assert.match(read.text, /Feature request/);
+            assert.match(read.summary, /title-only request still needs evaluation/);
+            assert.equal((await gh.review(gh.batch.issues[0])).isError, false);
+            await f.call('verify_candidate');
+            assert.equal((await f.call('accept_result', { decision: 'no_change', summary: 'Title requirement assessed',
+                lessons: [], feedbackReviewed: false, githubResolutions: gh.mappings })).isError, false);
+            return { decision: 'no_change', summary: 'Title requirement assessed' };
+        };
+        assert.equal((await runMainOwnedWorkflow(f.options)).githubResolutions.length, 1);
+    }
+});
+
+test('自仓 issue：逐条结论持久化失败，不得凭失败的内存receipt通过验收', async () => {
+    const f = fixture();
+    const gh = githubFixture(f);
+    f.options.runMain = async () => {
+        const blocked = path.resolve(f.directory, 'logs/main-fixture/github-issue-reviews.json');
+        assert.ok(blocked.startsWith(f.directory + path.sep));
+        fs.mkdirSync(blocked);
+        assert.equal((await gh.review(gh.batch.issues[0])).isError, true);
+        await f.call('verify_candidate');
+        assert.equal(JSON.parse((await f.call('accept_result', { decision: 'no_change', summary: 'Cannot accept a failed receipt',
+            lessons: [], feedbackReviewed: false, githubResolutions: gh.mappings })).content[0].text).state, 'github_issue_review_required');
+        return { decision: 'no_change', summary: 'Cannot accept a failed receipt' };
+    };
+    await assert.rejects(runMainOwnedWorkflow(f.options), error => error.code === 'review_rejected');
+});
+
+test('repairOnly 编排补丁沿用含issue的原prompt时仍可验收，但不输出业务结论', async () => {
+    const f = fixture();
+    f.options.runMain = async () => { await f.call('status'); throw createTeamError('cli_exit'); };
+    await assert.rejects(runMainOwnedWorkflow(f.options));
+    const orchestration = 'core/scripts/run-evolution-team.js';
+    f.edit(orchestration, 'reviewed orchestration repair');
+    f.options.resume = { ...f.checkpoints.at(-1), requiresApply: true,
+        allowedFiles: [orchestration], approvedScope: [orchestration], acceptanceChecks: ['repair behavior'],
+        fileFingerprints: { [orchestration]: sha('reviewed orchestration repair') } };
+    githubFixture(f);
+    f.options.runMain = async () => {
+        const status = JSON.parse((await f.call('status')).content[0].text);
+        assert.equal(status.githubIssues.required, false);
+        assert.equal((await f.call('verify_candidate')).isError, false);
+        assert.equal((await f.call('accept_result', { decision: 'approve', summary: 'Repair-only patch verified',
+            lessons: [], feedbackReviewed: true, githubResolutions: [] })).isError, false);
+        return { decision: 'approve', summary: 'Repair-only patch verified' };
+    };
+    const result = await runMainOwnedWorkflow(f.options);
+    assert.equal(result.repairOnly, true);
+    assert.equal(result.feedbackReviewed, false);
+    assert.deepEqual(result.githubResolutions, []);
+});
+
+test('legacy只留摘要且从未注入原文时可继续其他修复，但不得给issue结论或清账', async () => {
+    const f = fixture();
+    const gh = githubFixture(f);
+    f.options.prompt = 'Legacy task without any captured issue section';
+    fs.unlinkSync(gh.file);
+    f.options.runMain = async ({ prompt }) => {
+        assert.match(prompt, /legacyRawMissing=true/);
+        const status = JSON.parse((await f.call('status')).content[0].text);
+        assert.equal(status.githubIssues.legacyRawMissing, true);
+        assert.equal(status.githubIssues.available, false);
+        await f.call('verify_candidate');
+        const args = { decision: 'no_change', summary: 'Other checks complete', lessons: [], feedbackReviewed: false, githubResolutions: [] };
+        for (const invalid of [{ ...args, feedbackReviewed: true }, { ...args, githubResolutions: gh.mappings }]) {
+            assert.equal(JSON.parse((await f.call('accept_result', invalid)).content[0].text).state, 'github_legacy_feedback_unread');
+        }
+        assert.equal((await f.call('review_github_issue', { issue: 1 })).isError, true);
+        assert.equal((await f.call('accept_result', args)).isError, false);
+        return { decision: 'no_change', summary: args.summary };
+    };
+    const result = await runMainOwnedWorkflow(f.options);
+    assert.equal(result.feedbackReviewed, false);
+    assert.deepEqual(result.githubResolutions, []);
+    assert.match(result.mainSummary, /历史GitHub批次原文缺失，未声称已读或解决；旧反馈仍保留待补。$/);
+});
+
+test('legacy例外在Main启动前冻结，删损坏原文或迟到补文件均不能获得验收', async () => {
+    for (const variant of ['corrupt-then-delete', 'valid-then-delete', 'appeared-after-start']) {
+        const f = fixture();
+        const gh = githubFixture(f);
+        f.options.prompt = 'Legacy task without a captured issue section';
+        if (variant === 'corrupt-then-delete') fs.writeFileSync(gh.file, '{invalid');
+        if (variant === 'appeared-after-start') fs.unlinkSync(gh.file);
+        f.options.runMain = async () => {
+            if (variant === 'appeared-after-start') fs.writeFileSync(gh.file, JSON.stringify(gh.batch));
+            else fs.unlinkSync(gh.file);
+            await f.call('verify_candidate');
+            assert.equal((await f.call('accept_result', { decision: 'no_change', summary: 'Cannot change missing-source eligibility',
+                lessons: [], feedbackReviewed: false, githubResolutions: [] })).isError, true);
+            return { decision: 'no_change', summary: 'Cannot change missing-source eligibility' };
+        };
+        await assert.rejects(runMainOwnedWorkflow(f.options), error => error.code === 'review_rejected');
+    }
+});
 async function accept(f, decision = 'approve') {
     assert.equal((await f.call('verify_candidate')).isError, false);
     const seal = await f.call('accept_result', { decision, summary: 'Main checked actual results', lessons: [], feedbackReviewed: false, githubResolutions: [] });
@@ -77,6 +336,243 @@ function deferred() {
     const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
     return { promise, resolve, reject };
 }
+
+test('clean candidates cannot bypass the eight-area zero-change audit by asking for approve', async () => {
+    const f = fixture(); f.options.requireNoChangeAudit = true;
+    const file = path.resolve(f.directory, 'zero-change-evidence.json');
+    assert.ok(file.startsWith(f.directory + path.sep)); fs.writeFileSync(file, '{}');
+    const audit = require('../src/services/evolution-no-change-audit');
+    f.options.runMain = async ({ prompt }) => {
+        assert.match(prompt, /review_no_change/);
+        await f.call('verify_candidate');
+        const args = { decision: 'approve', summary: 'Clean candidate', lessons: [], feedbackReviewed: false, githubResolutions: [] };
+        assert.equal(JSON.parse((await f.call('accept_result', args)).content[0].text).state, 'no_change_audit_required');
+        const checked = await f.call('review_no_change', { checks: audit.AREAS.map(area => ({ area, status: 'checked',
+            conclusion: 'Bounded source evidence checked', evidencePaths: [file] })) });
+        assert.equal(checked.isError, false);
+        assert.equal((await f.call('accept_result', args)).isError, false);
+        return { decision: 'no_change', summary: 'Eight areas actually recorded' };
+    };
+    assert.equal((await runMainOwnedWorkflow(f.options)).decision, 'no_change');
+});
+
+let verificationSequence = 0;
+function freshInvestigation(f) {
+    const file = path.resolve(f.directory, `verification-${++verificationSequence}.json`);
+    assert.equal(path.dirname(file), f.directory);
+    fs.writeFileSync(file, JSON.stringify({ run: verificationSequence, fixture: 'new isolated regression result' }));
+    return { evidencePaths: [file], verification: { method: 'regression', checked: 'isolated fixture failure branch', result: 'new current baseline check passed' } };
+}
+function investigationFixture(f, question = 'Uncertain natural failure') {
+    const file = path.resolve(f.directory, 'investigation-evidence.json');
+    assert.ok(file.startsWith(f.directory + path.sep)); fs.writeFileSync(file, '{"observed":true}');
+    return { area: 'uncertain_incidents', status: 'monitoring', conclusion: 'Investigated; natural response still missing', evidencePaths: [file],
+        followup: { question, ruledOut: ['Known offline guard excluded'], missing: 'First failing natural response',
+            signal: 'Existing runtime error event', resolveWhen: 'Identify the stage and verify its fix',
+            mechanism: 'daily_log_review', nextCheckAt: Date.now() + 86400000 } };
+}
+
+test('repair rounds cannot clear pending feedback; failed or unpublished resolutions retain investigations', async () => {
+    const audit = require('../src/services/evolution-no-change-audit');
+    for (const ending of ['interrupted', 'accepted', 'commit_failed']) {
+        const f = fixture(); f.options.requireNoChangeAudit = true;
+        const question = investigationFixture(f);
+        if (ending === 'commit_failed') f.options.commit = async () => { throw createTeamError('publish_failed'); };
+        f.options.runMain = async () => {
+            await f.call('approve_plan', f.plan); f.edit(FILE, 'fixed candidate');
+            await f.call('record_investigation', question);
+            const pending = audit.getInvestigationFollowups(f.directory).pending[0];
+            await f.call('verify_candidate');
+            const proposal = await f.call('review_investigation', { id: pending.id, status: 'resolved',
+                conclusion: 'Candidate has a tested repair, publication still needed', ...freshInvestigation(f) });
+            assert.equal(JSON.parse(proposal.content[0].text).status, 'resolution_proposed');
+            assert.equal(audit.getInvestigationFollowups(f.directory).pending.length, 1);
+            if (ending === 'interrupted') throw createTeamError('cli_exit');
+            const args = { decision: 'approve', summary: 'Partial repair; followup retained', lessons: [], githubResolutions: [] };
+            assert.equal(JSON.parse((await f.call('accept_result', { ...args, feedbackReviewed: true })).content[0].text).state, 'investigations_pending');
+            assert.equal((await f.call('accept_result', { ...args, feedbackReviewed: false })).isError, false);
+            return { decision: 'approve', summary: args.summary };
+        };
+        if (ending === 'accepted') assert.equal((await runMainOwnedWorkflow(f.options)).feedbackReviewed, false);
+        else await assert.rejects(runMainOwnedWorkflow(f.options));
+        assert.equal(audit.getInvestigationFollowups(f.directory).pending.length, 1, ending);
+    }
+});
+
+test('clean baseline resolutions finalize only after Main returns a matching accepted result', async () => {
+    const audit = require('../src/services/evolution-no-change-audit');
+    for (const abortAfterSeal of [true, false]) {
+        const f = fixture(); f.options.requireNoChangeAudit = true;
+        const question = investigationFixture(f);
+        f.options.runMain = async () => {
+            await f.call('record_investigation', question);
+            const pending = audit.getInvestigationFollowups(f.directory).pending[0];
+            await f.call('verify_candidate');
+            await f.call('review_investigation', { id: pending.id, status: 'resolved', conclusion: 'Current unchanged baseline evidence explains the incident', ...freshInvestigation(f) });
+            await f.call('review_no_change', { checks: audit.AREAS.map(area => ({ area, status: 'checked', conclusion: 'Actual source snapshot checked', evidencePaths: question.evidencePaths })) });
+            assert.equal((await f.call('accept_result', { decision: 'no_change', summary: 'Clean baseline investigation complete', lessons: [], githubResolutions: [], feedbackReviewed: true })).isError, false);
+            assert.equal(audit.getInvestigationFollowups(f.directory).pending.length, 1, 'seal alone is not finalization');
+            if (abortAfterSeal) throw createTeamError('cli_exit');
+            return { decision: 'no_change', summary: 'Accepted baseline confirmed' };
+        };
+        if (abortAfterSeal) await assert.rejects(runMainOwnedWorkflow(f.options));
+        else assert.equal((await runMainOwnedWorkflow(f.options)).feedbackReviewed, true);
+        assert.equal(audit.getInvestigationFollowups(f.directory).pending.length, abortAfterSeal ? 1 : 0);
+    }
+});
+
+test('changing a proposed resolution back to monitoring cancels it and permits truthful partial acceptance', async () => {
+    const audit = require('../src/services/evolution-no-change-audit');
+    for (const via of ['review', 'registration', 'registration_whitespace', 'audit']) {
+        const f = fixture(); f.options.requireNoChangeAudit = true;
+        const question = investigationFixture(f);
+        f.options.runMain = async () => {
+            await f.call('record_investigation', question);
+            const pending = audit.getInvestigationFollowups(f.directory).pending[0];
+            await f.call('verify_candidate');
+            await f.call('review_investigation', { id: pending.id, status: 'resolved', conclusion: 'Initial resolution hypothesis', ...freshInvestigation(f) });
+            if (via === 'review') await f.call('review_investigation', { id: pending.id, status: 'monitoring',
+                conclusion: 'Further inspection requires a natural event', ...freshInvestigation(f), nextCheckAt: Date.now() + 2 * 86400000 });
+            if (via === 'registration') await f.call('record_investigation', question);
+            if (via === 'registration_whitespace') await f.call('record_investigation', { ...question,
+                followup: { ...question.followup, question: `  ${question.followup.question}  ` } });
+            await f.call('review_no_change', { checks: audit.AREAS.map(area => area === question.area && via === 'audit' ? question
+                : { area, status: 'checked', conclusion: 'Current source checked', evidencePaths: question.evidencePaths }) });
+            assert.equal((await f.call('accept_result', { decision: 'no_change', summary: 'No code change; monitoring continues',
+                lessons: [], githubResolutions: [], feedbackReviewed: false })).isError, false);
+            return { decision: 'no_change', summary: 'Monitoring continues' };
+        };
+        const result = await runMainOwnedWorkflow(f.options);
+        assert.equal(result.feedbackReviewed, false);
+        assert.match(result.mainSummary, /1项调查未结案/);
+        assert.equal(audit.getInvestigationFollowups(f.directory).pending.length, 1, via);
+    }
+});
+
+test('a large overdue backlog remains readable without preventing Main startup', async () => {
+    const f = fixture(); f.options.requireNoChangeAudit = true;
+    const audit = require('../src/services/evolution-no-change-audit');
+    const now = Date.now() - 86400000;
+    for (let i = 0; i < 30; i += 1) {
+        const question = investigationFixture(f, `${i} ${'evidence gap '.repeat(130)}`);
+        audit.recordInvestigation({ ...question, dataDir: f.directory, sourceRoot: f.directory, now, runId: 'old-run',
+            fingerprint: 'a'.repeat(64), followup: { ...question.followup, nextCheckAt: now + 1000 } });
+    }
+    let started = false;
+    f.options.runMain = async ({ prompt }) => {
+        started = true; assert.ok(prompt.length < 48 * 1024);
+        assert.match(prompt, /"dueCount":30/);
+        const reply = JSON.parse((await f.call('status')).content[0].text);
+        const status = reply.artifact ? JSON.parse(fs.readFileSync(reply.artifact, 'utf8')) : reply;
+        assert.equal(status.investigations.due.length, 30);
+        throw createTeamError('cli_exit');
+    };
+    await assert.rejects(runMainOwnedWorkflow(f.options));
+    assert.equal(started, true);
+    assert.equal(audit.getInvestigationFollowups(f.directory).due.length, 30);
+});
+
+test('required independent issue reader cannot be replaced by ordinary research or a success claim', async () => {
+    const f = fixture();
+    f.options.requireExternalReview = true;
+    f.options.runMain = async () => {
+        await f.call('delegate_worker', { instruction: 'Ordinary research', readOnly: true });
+        await f.call('verify_candidate');
+        const rejected = await f.call('accept_result', { decision: 'no_change', summary: 'Claim success', externalReviewAcknowledged: true });
+        assert.equal(JSON.parse(rejected.content[0].text).state, 'external_review_required');
+        const missing = await f.call('delegate_worker', { instruction: 'No actual report', readOnly: true, purpose: 'external_issues' });
+        assert.equal(missing.isError, true);
+        f.options.runWorker = async () => ({ decision: 'no_change', summary: 'not used' });
+        throw createTeamError('cli_exit');
+    };
+    await assert.rejects(runMainOwnedWorkflow(f.options));
+    assert.equal(f.commits, 0);
+});
+
+test('actual independent report needs Main acknowledgment and stays incomplete when sources unavailable', async () => {
+    const f = fixture();
+    f.options.requireExternalReview = true;
+    f.options.runWorker = async ({ prompt }) => {
+        const evidenceFile = prompt.match(/仅可将本任务证据写入 (.*?)。/)[1];
+        assert.ok(path.resolve(evidenceFile).startsWith(f.directory + path.sep));
+        fs.writeFileSync(evidenceFile, JSON.stringify({ state: 'unavailable', summary: 'Source unavailable', findings: [], gaps: ['GitHub source unavailable'] }), { mode: 0o600 });
+        return { decision: 'no_change', summary: 'Incomplete evidence kept' };
+    };
+    f.options.runMain = async ({ prompt }) => {
+        assert.match(prompt, /purpose="external_issues"/);
+        assert.equal((await f.call('delegate_worker', { instruction: 'Independent issues', readOnly: true, purpose: 'external_issues' })).isError, false);
+        await f.call('verify_candidate');
+        const args = { decision: 'no_change', summary: 'No change; external source unavailable', lessons: [], feedbackReviewed: false, githubResolutions: [] };
+        assert.equal((await f.call('accept_result', args)).isError, true);
+        assert.equal((await f.call('accept_result', { ...args, externalReviewAcknowledged: true })).isError, false);
+        const status = JSON.parse((await f.call('status')).content[0].text);
+        assert.equal(status.externalReview.state, 'unavailable');
+        assert.deepEqual(status.externalReview.gaps, ['GitHub source unavailable']);
+        return { decision: 'no_change', summary: args.summary };
+    };
+    const result = await runMainOwnedWorkflow(f.options);
+    assert.equal(result.decision, 'no_change');
+});
+
+test('source-cited external findings require Main local comparison and become stale after candidate edits', async () => {
+    const f = fixture();
+    f.options.requireExternalReview = true;
+    const knowledge = require('../src/services/evolution-knowledge');
+    knowledge.ingestKnowledge({ dataDir: f.directory, documents: [{ repo: 'fixture/example', kind: 'issue', number: 1,
+        title: 'scheduler', text: 'duplicate scheduling', state: 'open', updatedAt: '2026-01-01T00:00:00Z', commentsComplete: true }] });
+    const doc = knowledge.queryKnowledge({ dataDir: f.directory, query: 'scheduler' }).results[0];
+    f.options.runWorker = async ({ prompt }) => {
+        const file = prompt.match(/仅可将本任务证据写入 (.*?)。/)[1];
+        assert.ok(path.resolve(file).startsWith(f.directory + path.sep));
+        fs.writeFileSync(file, JSON.stringify({ state: 'complete', summary: 'Read the sampled issue and local caller', gaps: [],
+            findings: [{ id: doc.id, sourceHash: doc.sourceHash, disposition: 'not_affected', localEvidence: FILE, conclusion: 'Caller is different' }] }), { mode: 0o600 });
+        return { decision: 'no_change', summary: 'Actual cited report' };
+    };
+    f.options.runMain = async () => {
+        await f.call('approve_plan', f.plan);
+        await f.call('delegate_worker', { instruction: 'Read cached issue', readOnly: true, purpose: 'external_issues' });
+        await f.call('verify_candidate');
+        const args = { decision: 'no_change', summary: 'Main acceptance', lessons: [], feedbackReviewed: false, githubResolutions: [], externalReviewAcknowledged: true };
+        assert.equal(JSON.parse((await f.call('accept_result', args)).content[0].text).state, 'external_review_unadopted');
+        await f.call('record_knowledge_review', { id: doc.id, sourceHash: doc.sourceHash, disposition: 'not_affected', localEvidence: FILE, conclusion: 'Main checked actual caller' });
+        assert.equal((await f.call('accept_result', args)).isError, false);
+        f.edit(FILE, 'later source');
+        await f.call('verify_candidate');
+        assert.equal(JSON.parse((await f.call('accept_result', { ...args, decision: 'approve' })).content[0].text).state, 'external_review_required');
+        throw createTeamError('cli_exit');
+    };
+    await assert.rejects(runMainOwnedWorkflow(f.options));
+    assert.equal(f.commits, 0);
+});
+
+test('known unread comments cannot be hidden by a complete report, while explicit partial findings remain usable', async () => {
+    const f = fixture(); f.options.requireExternalReview = true;
+    const knowledge = require('../src/services/evolution-knowledge');
+    knowledge.ingestKnowledge({ dataDir: f.directory, documents: [{ repo: 'fixture/example', kind: 'issue', number: 1,
+        title: 'scheduler', text: 'report', state: 'open', updatedAt: '2026-01-01T00:00:00Z', commentCount: 5, commentsComplete: false }] });
+    const doc = knowledge.queryKnowledge({ dataDir: f.directory, query: 'scheduler' }).results[0];
+    const finding = { id: doc.id, sourceHash: doc.sourceHash, disposition: 'pending', localEvidence: FILE, conclusion: 'Five comments unread' };
+    let partial = false;
+    f.options.runWorker = async ({ prompt }) => {
+        const file = prompt.match(/仅可将本任务证据写入 (.*?)。/)[1];
+        assert.ok(path.resolve(file).startsWith(f.directory + path.sep));
+        fs.writeFileSync(file, JSON.stringify({ state: partial ? 'partial' : 'complete', summary: 'Issue compared with caller', findings: [finding], gaps: partial ? ['Five comments unread'] : [] }), { mode: 0o600 });
+        return { decision: 'no_change', summary: 'Reader result' };
+    };
+    f.options.runMain = async () => {
+        const args = { instruction: 'Read current issue', readOnly: true, purpose: 'external_issues' };
+        assert.equal((await f.call('delegate_worker', args)).isError, true);
+        partial = true;
+        assert.equal((await f.call('delegate_worker', args)).isError, false);
+        await f.call('record_knowledge_review', finding);
+        await f.call('verify_candidate');
+        assert.equal((await f.call('accept_result', { decision: 'no_change', summary: 'No local defect proven; unread comments retained',
+            lessons: [], feedbackReviewed: false, githubResolutions: [], externalReviewAcknowledged: true })).isError, false);
+        return { decision: 'no_change', summary: 'Known evidence gap preserved' };
+    };
+    const result = await runMainOwnedWorkflow(f.options);
+    assert.equal(result.decision, 'no_change');
+});
 async function within(promise) {
     let timer;
     try {
@@ -638,4 +1134,37 @@ test('an unchanged environmental retry requires and retains an explicit Main exp
     };
     assert.equal((await runMainOwnedWorkflow(f.options)).decision, 'no_change');
     assert.equal(checks, 2);
+});
+
+
+test('feasible owner feedback cannot seal a selected plan or unrelated change as completion', async () => {
+    for (const unrelated of [false, true]) {
+        const f = fixture(); const gh = githubFixture(f, 1);
+        f.options.runMain = async () => {
+            if (unrelated) { await f.call('approve_plan', f.plan); f.edit(FILE, 'unrelated changed caller'); }
+            await f.call('verify_candidate');
+            await gh.review(gh.batch.issues[0], { blocker: null, note: gh.mappings[0].note });
+            const args = { decision: unrelated ? 'approve' : 'no_change', summary: 'Selected implementation still unfinished', lessons: [], feedbackReviewed: false, githubResolutions: gh.mappings };
+            assert.equal(JSON.parse((await f.call('accept_result', args)).content[0].text).state, 'github_implementation_required');
+            await gh.review(gh.batch.issues[0]);
+            assert.equal((await f.call('accept_result', args)).isError, false);
+            return { decision: args.decision, summary: args.summary };
+        };
+        await runMainOwnedWorkflow(f.options);
+    }
+});
+
+test('a genuinely verified existing implementation can close an issue on its published baseline without a cosmetic diff', async () => {
+    const f = fixture(); const gh = githubFixture(f, 1);
+    f.options.runMain = async () => {
+        await f.call('verify_candidate');
+        const note = 'Existing published caller verified by current full regression';
+        fs.writeFileSync(gh.evidence, JSON.stringify({ verifiedPublishedCaller: true }));
+        await gh.review(gh.batch.issues[0], { status: 'fixed', note, nextAction: '', existingCommit: HEAD, implementationFiles: [FILE] });
+        const resolutions = [{ issue: 1, status: 'fixed', fingerprint: gh.batch.issues[0].fingerprint, note }];
+        const accepted = await f.call('accept_result', { decision: 'no_change', summary: note, lessons: [], feedbackReviewed: true, githubResolutions: resolutions });
+        assert.equal(accepted.isError, false);
+        return { decision: 'no_change', summary: note };
+    };
+    assert.equal((await runMainOwnedWorkflow(f.options)).feedbackReviewed, true);
 });

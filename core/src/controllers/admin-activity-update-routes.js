@@ -1,3 +1,4 @@
+const { validClientVersion } = require('../runtime/client-runtime-version');
 const activity = require('../services/activity');
 const {
   getActivityUpdateState,
@@ -6,6 +7,9 @@ const {
   startActivityUpdateMonitor,
 } = require('../services/activity-update-monitor');
 const activityEvolver = require('../services/activity-evolver');
+const { getDataDir } = require('../config/runtime-paths');
+const { recordUpdateDigest } = require('../services/game-update-digest');
+const crypto = require('node:crypto');
 
 const NON_FAILURE_EVOLUTION_START_REASONS = new Set([
   'busy',
@@ -88,6 +92,33 @@ function requireEvolutionConfigAdmin(req, res, next) {
   return next();
 }
 
+// 证据概要脱敏：只保留各入口状态/数量/时间/语义哈希与缺证项；
+// 不透出公告标题正文、邮件 ID 明细或任何账号身份。
+function anonymizeGameUpdateEvidence(evidence) {
+  if (!evidence || typeof evidence !== 'object') return { status: 'unknown', error: '证据回包为空' };
+  const sources = {};
+  for (const [name, value] of Object.entries(evidence.sources || {})) {
+    sources[name] = value?.status === 'ok' || value?.status === 'partial'
+      ? { status: value.status, fetchedAt: value.fetchedAt,
+        factsHash: /^[a-f0-9]{64}$/.test(value.factsHash) ? value.factsHash : '',
+        ...(name === 'clientVersion' ? { latestVersion: validClientVersion(value.latestVersion) ? value.latestVersion : '', configuredVersion: validClientVersion(value.configuredVersion) ? value.configuredVersion : '', currentVersion: validClientVersion(value.currentVersion) ? value.currentVersion : '', synchronized: value.synchronized === true && validClientVersion(value.currentVersion) && validClientVersion(value.configuredVersion), outdated: value.outdated === true } : {}),
+        ...(name === 'announcements' ? { entries: value.entries, listComplete: value.listComplete === true } : {}),
+        ...(name === 'emails' ? { boxes: Object.fromEntries([1, 2].map(box => [box, {
+          status: value.boxes?.[box]?.status || 'unknown',
+          factsHash: /^[a-f0-9]{64}$/.test(value.boxes?.[box]?.factsHash) ? value.boxes[box].factsHash : '',
+        }])) } : {}) }
+      : { status: 'unknown', errorClass: value?.errorClass || '' };
+  }
+  return {
+    status: String(evidence.status || 'unknown'),
+    collectedAt: Number(evidence.collectedAt) || 0,
+    semanticHash: /^[a-f0-9]{64}$/.test(evidence.semanticHash) ? evidence.semanticHash : '',
+    factsComplete: evidence.factsComplete === true,
+    sources,
+    gaps: Array.isArray(evidence.gaps) ? evidence.gaps.map(gap => String(gap?.entry || '')).filter(Boolean) : [],
+  };
+}
+
 function registerAdminActivityUpdateRoutes({ app, provider, store, requireAdminToken }) {
   const knownActivityIds = Object.entries(activity)
     .filter(([key, value]) => key.endsWith('_ACTIVITY_ID') && Number.isFinite(Number(value)))
@@ -107,6 +138,20 @@ function registerAdminActivityUpdateRoutes({ app, provider, store, requireAdminT
         groups: [],
         unknownActivityIds: [],
       };
+    }
+
+    // 既有扫描流程先做一次有界更新证据采集（公告/双箱邮件/节日/任务/图鉴/商城
+    // 各一次，Worker 侧 60s 缓存共享）。失败/缺接口返回显式 unknown 概要，
+    // 不吞错、不冒充空态，也不让证据失败中断整轮活动扫描。
+    let collectedGameUpdateEvidence = null;
+    let gameUpdateEvidence = { status: 'unknown', error: '证据采集入口不可用' };
+    if (typeof provider.getGameUpdateEvidence === 'function') {
+      try {
+        collectedGameUpdateEvidence = await provider.getGameUpdateEvidence(account.id, {});
+        gameUpdateEvidence = anonymizeGameUpdateEvidence(collectedGameUpdateEvidence);
+      } catch {
+        gameUpdateEvidence = { status: 'unknown', errorClass: 'read_failed' };
+      }
     }
 
     const activities = await provider.getActivityDiscoveryList(account.id);
@@ -150,7 +195,10 @@ function registerAdminActivityUpdateRoutes({ app, provider, store, requireAdminT
       if (bag?.seedRecognition) seedRecognition = bag.seedRecognition;
     } catch { /* 无库存证据不等于没有识别缺口。 */ }
     let festivalCalendar = null;
-    if (typeof provider.getSolarCalendar === 'function') {
+    if (collectedGameUpdateEvidence) {
+      const solar = collectedGameUpdateEvidence.sources?.solarCalendar;
+      festivalCalendar = solar?.status === 'ok' ? { available: true, ...solar.state } : { available: false, error: '节日签到读取未完成' };
+    } else if (typeof provider.getSolarCalendar === 'function') {
       try { festivalCalendar = { available: true, ...await provider.getSolarCalendar(account.id) }; }
       catch { festivalCalendar = { available: false, error: '节日签到读取失败，不能据此认定没有活动' }; }
     }
@@ -158,6 +206,7 @@ function registerAdminActivityUpdateRoutes({ app, provider, store, requireAdminT
       available: true,
       seedRecognition,
       festivalCalendar,
+      gameUpdateEvidence,
       accountName: account.name || account.nick || '在线账号',
       scannedAt: Date.now(),
       activities,
@@ -173,14 +222,29 @@ function registerAdminActivityUpdateRoutes({ app, provider, store, requireAdminT
       unknownActivityIds: unknown.map(item => Number(item.id)),
     };
   };
+  const prepareGameUpdateReview = async () => {
+    const accounts = provider.getAccounts()?.accounts || [];
+    const account = accounts.find(item => item.running && provider.isAccountRunning(item.id)
+      && provider.getStatus(item.id)?.connection?.connected === true);
+    if (!account || typeof provider.getGameUpdateEvidence !== 'function') return { status: 'unavailable' };
+    const evidence = anonymizeGameUpdateEvidence(await provider.getGameUpdateEvidence(account.id, {}));
+    const scannedAt = Date.now();
+    const digest = crypto.createHash('sha256').update(JSON.stringify(evidence.sources)).digest('hex');
+    recordUpdateDigest(getDataDir(), { scannedAt, online: { gameUpdateEvidence: evidence } }, digest);
+    return { status: evidence.status, collectedAt: evidence.collectedAt };
+  };
   startActivityUpdateMonitor({
     knownActivityIds,
     onlineScanner: scanOnlineActivities,
     localScanEnabled: String(process.env.ACTIVITY_LOCAL_SCAN_ENABLED || '').toLowerCase() === 'true',
     // 每次扫描登记新/结束活动；自主开启时空闲后立即进化，同批去重，不占每日名额。
-    onReport: report => activityEvolver.checkAndMaybeEvolve(report),
+    onReport: report => {
+      activityEvolver.checkAndMaybeEvolve(report);
+      activityEvolver.checkGameUpdateEvidence();
+    },
   });
   activityEvolver.startActivityEvolver({ store,
+    prepareGameUpdateReview,
     prepareWxRestart: input => provider?.prepareWxRestart?.(input),
     validateWxRestart: async handoff => await provider?.validateWxRestart?.(handoff) === true,
     cancelWxRestart: input => provider?.cancelWxRestart?.(input),

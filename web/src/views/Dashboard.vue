@@ -13,6 +13,7 @@ import { useBagStore } from '@/stores/bag'
 import { useStatusStore } from '@/stores/status'
 import { useToastStore } from '@/stores/toast'
 import { formatCouponAmount, formatGoldAmount, formatGoldBeanAmount } from '@/utils/number-format'
+import { AUTOMATION_CATEGORY_LABELS, AUTOMATION_LOG_EVENT_GROUPS, getDailyEventCategory } from '@/utils/automation-observability'
 
 const statusStore = useStatusStore()
 const accountStore = useAccountStore()
@@ -42,7 +43,7 @@ async function reloginFromHome() {
   const flow = loginFlowSeq
   const requestedAccountId = account.id
   try {
-    // 先试直接登录（refreshtoken 刷凭据，无需扫码）；失败自动弹扫码。
+    // 优先恢复现有连接，只有后端明确需要扫码时才打开扫码页。
     // await 期间用户可能已切换账号或已主动重新扫码：迟到结果既不能给
     // 别的账号弹扫码、不能误提示旧成功，也不能重新弹已被扫码取代的 QR。
     const result = await accountStore.reloginAccount(account.id)
@@ -51,14 +52,22 @@ async function reloginFromHome() {
     if (superseded)
       return
     if (result.ok) {
-      toast.success('直接登录成功（免扫码）')
+      toast.success(result.mode === 'existing_connection' ? '已恢复现有连接（未重新登录游戏）' : '直接登录成功（免扫码）')
+      void Promise.allSettled([statusStore.fetchStatus(requestedAccountId), accountStore.fetchAccounts()])
       return
     }
-    showReloginModal.value = true
-  }
-  catch {
-    if (loginFlowSeq === flow && accountStore.currentAccount?.id === requestedAccountId)
+    if (result.needScan === true)
       showReloginModal.value = true
+    else
+      toast.error(result.error || '连接恢复尚未完成，请稍后重试')
+  }
+  catch (error: any) {
+    if (loginFlowSeq === flow && accountStore.currentAccount?.id === requestedAccountId) {
+      if (error?.response?.data?.needScan === true)
+        showReloginModal.value = true
+      else
+        toast.error(error?.response?.data?.error || '暂时无法恢复连接，请稍后重试')
+    }
   }
   finally {
     if (loginFlowSeq === flow)
@@ -155,6 +164,7 @@ const modules = [
 // 用逗号合并（后端按逗号拆分做 OR 匹配）
 const events = [
   { label: '全部事件', value: '' },
+  ...AUTOMATION_LOG_EVENT_GROUPS,
   { label: '偷好友菜', value: '偷好友菜' },
   { label: '化肥趋势触发', value: '化肥趋势触发' },
   { label: '化肥盯梢冷却', value: '化肥盯梢冷却' },
@@ -313,7 +323,7 @@ interface WatchlistRipe {
 const watchlistRipe = ref<WatchlistRipe[]>([])
 let watchlistTicker = 0
 // 盯梢窗口分钟数（重点好友可配，默认 122）；inWindow 判断用它而不是写死
-const watchlistWindowMinutes = ref(122)
+const watchlistWindowMinutes = ref(1)
 
 // 服务端快照按 30s 推一次，这里本地每秒衰减 remainSec 保持平滑。
 // ripeAt 每次巡田会重估：未成熟期间后移的新估计不接受（保持倒计时单调
@@ -602,14 +612,24 @@ function getExpPercent(progress: any) {
 }
 
 interface DailyEvent {
+  id?: string
   at: number
   level: 'info' | 'warn' | 'error'
   type: string
   message: string
   count?: number
+  category?: string
 }
 
 const dailyEvents = ref<DailyEvent[]>([])
+const dailyEventCategory = ref('')
+const dailyEventCategories = [{ label: '全部分类', value: '' }, ...Object.entries(AUTOMATION_CATEGORY_LABELS).map(([value, label]) => ({ label, value }))]
+const visibleDailyEvents = computed(() => dailyEvents.value.filter(event => !dailyEventCategory.value || getDailyEventCategory(event) === dailyEventCategory.value).slice().reverse())
+watch(currentAccountId, () => {
+  dailyEventCategory.value = ''
+  dailyEvents.value = []
+  dailyEventsRequestId += 1
+})
 const downloadingDailyEvents = ref(false)
 const downloadingStealEvents = ref(false)
 let dailyEventsRequestId = 0
@@ -697,6 +717,7 @@ const EVENT_LEVEL_STYLE: Record<string, string> = {
   error: 'text-red-600 dark:text-red-400',
 }
 const EVENT_TYPE_LABELS: Record<string, string> = {
+  ...Object.fromEntries(Object.entries(AUTOMATION_CATEGORY_LABELS).map(([key, label]) => [`auto_${key}`, label])),
   harvest: '收菜',
   plant: '播种',
   steal: '偷菜',
@@ -863,7 +884,7 @@ useIntervalFn(updateCountdowns, 1000)
       <div class="flex items-center gap-2 text-sm text-amber-800 dark:text-amber-200">
         <div class="i-carbon-warning-alt text-lg" />
         <span>
-          请求异常降速中：普通巡查放缓到约 {{ slowdownDelaySec }} 秒级，自己收获、成熟抢收和施肥 HOT 保持运行；约
+          请求异常降速中：普通巡查放缓到约 {{ slowdownDelaySec }} 秒级，自己收获、重点在线监控和成熟到点动作保持运行；约
           <span class="font-bold font-mono">{{ formatDuration(slowdownRemainSec) }}</span>
           后恢复常规节奏
         </span>
@@ -891,7 +912,7 @@ useIntervalFn(updateCountdowns, 1000)
               v-if="currentAccount?.platform === 'wx'"
               class="rounded bg-emerald-500 px-2 py-1 text-xs text-white transition hover:bg-emerald-600 disabled:opacity-50"
               :disabled="reloginBusy"
-              title="先走免扫码直接登录，失败自动弹扫码"
+              title="优先恢复现有连接，确认离线后再尝试登录"
               @click="reloginFromHome"
             >
               {{ reloginBusy ? '登录中…' : '重新登录' }}
@@ -933,7 +954,7 @@ useIntervalFn(updateCountdowns, 1000)
           </div>
           <div class="mt-2 flex justify-between text-xs text-gray-400">
             <span>效率: {{ expRate }}</span>
-            <span>{{ timeToLevel }}</span>
+            <span v-if="timeToLevel" title="按本次运行已获得经验的平均速度估算，未计入尚未收获作物的经验；集中成熟时可能有较大偏差。">历史效率估算：{{ timeToLevel }}</span>
           </div>
         </div>
       </div>
@@ -1133,6 +1154,7 @@ useIntervalFn(updateCountdowns, 1000)
               <span class="mr-2 select-none text-gray-400">[{{ formatLogTime(log.time, log.ts) }}]</span>
               <span class="mr-2 rounded px-1.5 py-0.5 text-xs font-bold" :class="getLogTagClass(log.tag)">{{ log.tag }}</span>
               <span v-if="log.meta?.event" class="mr-2 rounded bg-blue-50 px-1.5 py-0.5 text-xs text-blue-500 dark:bg-blue-900/20 dark:text-blue-400">{{ getEventLabel(log.meta.event) }}</span>
+              <span v-if="log.meta?.automationCategory" class="mr-2 text-xs text-violet-500">{{ AUTOMATION_CATEGORY_LABELS[log.meta.automationCategory] || '' }}</span>
               <span :class="getLogMsgClass(log.tag)">{{ log.msg }}</span>
             </div>
           </div>
@@ -1239,7 +1261,7 @@ useIntervalFn(updateCountdowns, 1000)
         <h3 class="mb-3 flex items-center gap-2 text-lg font-medium">
           <div class="i-carbon-star-filled text-yellow-500" />
           <span>重点监控</span>
-          <span class="ml-auto text-xs text-gray-400 font-normal">常态低频；确认施肥后自动进入 HOT</span>
+          <span class="ml-auto text-xs text-gray-400 font-normal">在线时敏捷监控；其余按已知成熟时间执行</span>
         </h3>
         <div class="space-y-1.5">
           <div
@@ -1252,7 +1274,7 @@ useIntervalFn(updateCountdowns, 1000)
               <span
                 v-if="item.inWindow"
                 class="shrink-0 rounded bg-emerald-100 px-1.5 py-0.5 text-xs text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300"
-                :title="`已进入 ${watchlistWindowMinutes} 分钟成熟观察窗口；仅确认施肥后切换 HOT 并放宽门限`"
+                :title="`已进入 ${watchlistWindowMinutes} 分钟自然成熟布控窗口；按成熟时刻执行，不进行施肥趋势追踪`"
               >成熟观察</span>
             </div>
             <div class="text-sm font-bold font-mono" :class="item.inWindow ? 'text-emerald-500' : 'text-gray-500'">
@@ -1267,7 +1289,8 @@ useIntervalFn(updateCountdowns, 1000)
           <div class="i-carbon-list-checked" />
           <span>今日事件</span>
           <div class="ml-auto flex flex-wrap items-center justify-end gap-2">
-            <span class="text-xs text-gray-400 font-normal">仅保留当天</span>
+            <span class="text-xs text-gray-400 font-normal">动作与重要事件 · 当天最近 200 条</span>
+            <BaseSelect v-model="dailyEventCategory" :options="dailyEventCategories" class="w-28" />
             <BaseButton
               variant="secondary"
               size="sm"
@@ -1292,13 +1315,13 @@ useIntervalFn(updateCountdowns, 1000)
             </BaseButton>
           </div>
         </h3>
-        <div v-if="!dailyEvents.length" class="ui-subtle-panel rounded-lg p-6 text-center text-sm text-gray-400">
-          今天还没有记录到事件
+        <div v-if="!visibleDailyEvents.length" class="ui-subtle-panel rounded-lg p-6 text-center text-sm text-gray-400">
+          {{ dailyEvents.length ? '该分类暂无已执行动作' : '今天还没有记录到事件' }}
         </div>
         <div v-else class="max-h-80 overflow-y-auto pr-1 space-y-1.5">
           <div
-            v-for="ev in [...dailyEvents].reverse()"
-            :key="`${ev.at}-${ev.type}`"
+            v-for="ev in visibleDailyEvents"
+            :key="ev.id || `${ev.at}-${ev.type}`"
             class="ui-subtle-panel flex items-start gap-2 rounded-lg px-3 py-1.5"
           >
             <span class="shrink-0 text-xs text-gray-400 font-mono">{{ formatEventTime(ev.at) }}</span>

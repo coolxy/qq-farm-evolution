@@ -550,10 +550,10 @@ test('existing quiet-hour help protection retains explicit steal path and quotas
 });
 
 test('valid pre-enter reply is reused once and actual CheckCanOperate/batch per-land fallback preserved', async t => {
-  const h = makeHarness(t); const now = h.clock.now;
+  const h = makeHarness(t); h.state.priorities = [81001]; h.watch.setPriorityGids([81001]); const now = h.clock.now;
   const lands = [1, 2].map(id => ({ id, plant: { id: 1, stealable: true, steal_num: 1, phases: [{ phase: 4 }] } }));
   h.state.analyzer = { stealable: [1, 2], stealableInfo: [{ landId: 1, name: '合成果实' }, { landId: 2, name: '合成果实' }] };
-  h.state.stealHandler = (_gid, ids) => { if (ids.length > 1) throw new Error('expected batch competition'); return {}; };
+  h.state.stealHandler = (_gid, ids) => { if (ids.length > 1) throw Object.assign(new Error('expected batch competition'), { isServerBusinessError: true, serverErrorCode: 12345 }); return {}; };
   const tally = { steal: 0, water: 0, weed: 0, bug: 0, putBug: 0, putWeed: 0 };
   const result = await h.visit.visitFriendForSteal({ gid: 81001, name: '合成好友' }, tally, 80001, 'synthetic-budget-account',
     { preEnter: { gid: 81001, enteredAt: now, epochAtSend: 7, enterReply: { lands } } });
@@ -586,7 +586,7 @@ test('precise land wall clock survives missing and zero summary maturity and dis
   assert.equal(h.state.composites.length, 1);
 });
 
-for (const mode of ['prearm', 'hot']) test(`actual ${  mode.toUpperCase()  } watcher dispatch adds zero summary wait during refusal gate`, async t => {
+for (const mode of ['prearm']) test(`actual ${  mode.toUpperCase()  } watcher dispatch adds zero summary wait during refusal gate`, async t => {
   const h = makeHarness(t);
   await h.orchestrator.checkFriends({ onlySteal: true }); const gate = stateOf(h).gate;
   h.watch.watchFriend(81001, '合成好友', { now: h.clock.now, ripeAt: h.clock.now + 1000, mode, reason: 'synthetic trusted evidence' });
@@ -600,10 +600,10 @@ for (const mode of ['prearm', 'hot']) test(`actual ${  mode.toUpperCase()  } wat
 });
 
 test('actual visit retryNeeded retains original 90-second evidence and future land observation updates wall clock', async t => {
-  const h = makeHarness(t); const sec = h.clock.now / 1000;
+  const h = makeHarness(t); h.state.priorities = [81001]; const sec = h.clock.now / 1000;
   seed(h, [dueFriend(81001, 0, { steal_plant_num: 1 })]); const first = stateOf(h).actionCache[0];
   h.state.analyzer = { stealable: [1], stealableInfo: [{ landId: 1, name: '合成果实' }] };
-  h.state.stealHandler = () => { throw new Error('expected competition'); };
+  h.state.stealHandler = () => { throw Object.assign(new Error('expected competition'), { isServerBusinessError: true, serverErrorCode: 12345 }); };
   const enter = deferred(); enter.resolve({ lands: [{ id: 1, plant: { id: 100, stealable: true, steal_num: 1, phases: [{ begin_time: sec - 10 }, { begin_time: sec - 1 }] } }] });
   h.state.enterGate = enter;
   await h.orchestrator.checkFriends({ onlySteal: true });
@@ -720,4 +720,11 @@ test('fixture cleanup runs after a deliberate body failure and restores all real
   })(), /deliberate fixture body failure/);
   assert.equal(liveHarnesses.has(h), false); assert.equal(h.orchestrator.isFriendVisitBusy(), false);
   assert.deepEqual(fingerprint(), before);
+});
+
+test('retired fertilizer HOT cannot dispatch an extra visit during a summary refusal gate', async t => {
+  const h = makeHarness(t); await h.orchestrator.checkFriends({ onlySteal: true }); const before = stateOf(h).gate;
+  assert.equal(h.watch.watchFriend(81001, '合成好友', { now: h.clock.now, ripeAt: h.clock.now + 1000, mode: 'hot', reason: 'fertilizer_count_decreased' }), false);
+  assert.equal(h.watch.getNextWatchDueAt(), 0); await h.orchestrator.checkFriends({ onlySteal: true });
+  assert.equal(h.state.visits.length, 0); assert.equal(h.state.composites.length, 1); assert.deepEqual(stateOf(h).gate, before);
 });

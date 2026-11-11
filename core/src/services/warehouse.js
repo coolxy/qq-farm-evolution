@@ -190,18 +190,40 @@ function invalidatePanelBagCache() {
   panelBagInFlight = null;
 }
 
-function toSellItem(raw) {
+function toSellItem(raw, exactMaterial = false) {
+  // 2026-11-02：手动出售统一按 64 位精确编码（Long.fromString），不再经
+  // toNumber 往返（>2^53 的 UID/数量/单价会失真）。小整数语义不变。
+  const Long = require('long');
+  const exactCount = (value) => {
+    if (Long.isLong(value)) return value;
+    if (typeof value === 'string' && /^-?\d+$/.test(value)) return Long.fromString(value);
+    return Long.fromNumber(toNum(value));
+  };
+  if (exactMaterial) {
+    const item = { id: toLong(raw.id), count: exactCount(raw.count) };
+    if (raw.uid != null && BigInt(String(raw.uid)) > 0n) item.uid = Long.fromString(String(raw.uid));
+    return item;
+  }
   const id = toNum(raw && raw.id);
-  const count = toNum(raw && raw.count);
+  const item = { id: toLong(id), count: exactCount(raw && raw.count) };
   const uid = toNum(raw && raw.uid);
-  const item = { id: toLong(id), count: toLong(count) };
-  if (uid > 0) item.uid = toLong(uid);
+  const uidText = raw && raw.uid != null ? String(raw.uid) : '';
+  if (uid > 0 || /^\d+$/.test(uidText) && BigInt(uidText) > 0n) item.uid = exactCount(raw.uid);
   return item;
 }
 
 async function sellItems(items) {
+  const materials = require('../gameConfig/MilkTeaActivity.json').recipes;
+  if (items.some(item => materials.some(row => row.fruitItemId > 0 && row.fruitItemId === toNum(item?.id)))) {
+    return require('./milk-tea-activity').withMilkTeaMaterialSale(items, () => sendSellItems(items, true));
+  }
+  return sendSellItems(items);
+}
+
+async function sendSellItems(items, exactMaterials = false) {
+  const materialIds = exactMaterials ? new Set(require('../gameConfig/MilkTeaActivity.json').recipes.map(row => row.fruitItemId).filter(id => id > 0)) : null;
   const request = types.SellRequest.encode(
-    types.SellRequest.create({ items: items.map(toSellItem) })
+    types.SellRequest.create({ items: items.map(item => toSellItem(item, materialIds?.has(toNum(item?.id)) === true)) })
   ).finish();
   const { body } = await sendMsgAsync('gamepb.itempb.ItemService', 'Sell', request);
   invalidatePanelBagCache();
@@ -212,20 +234,25 @@ async function sellItems(items) {
  * 使用背包物品。官方请求要求携带物品 UID；未显式传入时从背包查找。
  */
 async function useItem(itemId, count = 1, uid = 0) {
-  let itemUid = toNum(uid);
-  if (itemUid <= 0) {
+  const { decimalOf, assertPositiveInt } = require('./manual-commerce');
+  const idText = assertPositiveInt(itemId, '物品编号');
+  const countText = assertPositiveInt(count, '使用数量');
+  let itemUid = decimalOf(uid);
+  if (!itemUid) throw new Error('物品 UID 必须为精确的非负64位整数');
+  if (itemUid === '0') {
     const bag = await getBag();
     const bagItem = getBagItems(bag).find((item) =>
       toNum(item && item.id) === toNum(itemId) && toNum(item && item.count) > 0
     );
-    itemUid = toNum(bagItem && bagItem.uid);
+    itemUid = decimalOf(bagItem?.uid ?? 0);
+    if (!itemUid) throw new Error('背包物品 UID 无法精确识别');
   }
 
   const request = types.UseRequest.encode(
     types.UseRequest.create({
       item: {
-        id: toLong(itemId),
-        count: toLong(count),
+        id: toLong(idText),
+        count: toLong(countText),
         uid: toLong(itemUid),
       },
     })
@@ -236,11 +263,13 @@ async function useItem(itemId, count = 1, uid = 0) {
 }
 
 async function batchUseItems(entries) {
-  const items = (entries || []).map((e) => ({
-    id: toLong(e.itemId),
-    count: toLong(e.count || 1),
-    uid: toLong(e.uid || 0),
-  }));
+  const { decimalOf, assertPositiveInt } = require('./manual-commerce');
+  const items = (entries || []).map((e) => {
+    const uid = decimalOf(e.uid ?? 0);
+    if (!uid) throw new Error('物品 UID 必须为精确的非负64位整数');
+    return { id: toLong(assertPositiveInt(e.itemId, '物品编号')),
+      count: toLong(assertPositiveInt(e.count ?? 1, '使用数量')), uid: toLong(uid) };
+  });
 
   const request = types.BatchUseRequest.encode(
     types.BatchUseRequest.create({ items })
@@ -362,14 +391,19 @@ function isFertilizerContainerFullError(err) {
 
 async function autoOpenFertilizerGiftPacks() {
   try {
+    require('./automation-observability').logAutomationQuery('fertilizer', '正在查询背包化肥道具与容器余量');
     const bag = await getBag();
     const items = getBagItems(bag);
     const payloads = collectFertilizerUsePayload(items);
 
-    if (payloads.length <= 0) return 0;
+    if (payloads.length <= 0) {
+      require('./automation-observability').logAutomationQuery('fertilizer', '化肥查询完成：没有可使用的化肥道具');
+      return 0;
+    }
 
     const containerHours = getContainerHoursFromBagItems(items);
     let totalUsed = 0;
+    let attempted = 0;
     const usedLabels = [];
 
     for (const payload of payloads) {
@@ -395,6 +429,7 @@ async function autoOpenFertilizerGiftPacks() {
 
       let used = 0;
       try {
+        attempted += 1;
         await batchUseItems([{ itemId, count, uid: 0 }]);
         used = count;
       } catch {
@@ -418,6 +453,10 @@ async function autoOpenFertilizerGiftPacks() {
       log('仓库', `自动使用化肥类道具 x${totalUsed}${usedLabels.length ? ` [${usedLabels.join('，')}]` : ''}`, {
         module: 'warehouse', event: '开启化肥礼包', result: 'ok', count: totalUsed,
       });
+    } else {
+      require('./automation-observability').logAutomationQuery('fertilizer', attempted > 0
+        ? '化肥使用结果尚未确认，请按后续背包状态核对'
+        : '化肥查询完成：容器余量或道具条件不满足，本轮未填充');
     }
 
     return totalUsed;
@@ -499,14 +538,16 @@ async function getBagDetail() {
   const bag = await getBagForPanel();
   const items = getBagItems(bag);
 
-  // 原始物品列表
+  // 原始物品列表（countDec/uidDec 为精确十进制；小整数 count/uid 保持旧字段兼容）
   const originalItems = [];
   for (const item of items || []) {
     const id = toNum(item.id);
     const count = toNum(item.count);
     const uid = toNum(item.uid);
+    const countDec = String(item.count ?? '');
+    const uidDec = String(item.uid ?? '');
     if (id <= 0 || count <= 0) continue;
-    originalItems.push({ id, count, uid });
+    originalItems.push({ id, count, uid, countDec, uidDec, mutantTypes: (item.mutant_types || []).map(String), locked: item.locked === true || item.is_locked === true });
   }
 
   // 按 ID 去重合并
@@ -544,6 +585,7 @@ async function getBagDetail() {
     const directSell = String(info && info.sells || '').match(/^(\d+):(\d+)$/);
     const effectivePriceId = directSell ? Number(directSell[1]) : priceId;
     const effectivePrice = directSell ? Number(directSell[2]) : (info ? Number(info.price) || 0 : 0);
+    const priceDec = directSell ? directSell[2] : (info && info.price != null ? String(info.price) : '0');
     const priceUnit =
       effectivePriceId === 1005 ? '金豆豆' :
       effectivePriceId === 200 ? '点券' : '金';
@@ -552,6 +594,7 @@ async function getBagDetail() {
       merged.set(id, {
         id,
         count: 0,
+        countDec: '0',
         name,
         image: getItemImageById(id)
           || (category === 'seed' ? getSeedImageByName(name) || getPlantImageByPhase(0, 1) : ''),
@@ -559,6 +602,7 @@ async function getBagDetail() {
         itemType: info ? Number(info.type) || 0 : 0,
         priceId: effectivePriceId,
         price: effectivePrice,
+        priceDec,
         priceUnit,
         sellable: Boolean(directSell || getPlantByFruitId(id)),
         usable: Number(info && info.can_use) === 1 || interactionType === 'use',
@@ -569,6 +613,17 @@ async function getBagDetail() {
       });
     }
     merged.get(id).count += count;
+    const rawCountDec = String(item.count ?? '0');
+    if (/^\d+$/.test(rawCountDec)) {
+      merged.get(id).countDec = (BigInt(merged.get(id).countDec) + BigInt(rawCountDec)).toString();
+    }
+  }
+
+  const { bagItemQuote, quoteFingerprint } = require('./manual-commerce');
+  for (const item of merged.values()) {
+    const quote = bagItemQuote(item.id, originalItems);
+    item.saleQuoteFingerprint = quoteFingerprint(quote);
+    item.sellable = quote.sellable && quote.price !== '' && quote.priceId > 0 && BigInt(quote.price) > 0n;
   }
 
   // 计算容器时间显示

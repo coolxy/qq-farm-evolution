@@ -221,14 +221,19 @@ function formatLocalDateTime24(date = new Date()) {
 // ==================== 日志/统计钩子 ====================
 
 setLogHook((tag, msg, isWarn, meta) => {
+    let observed = { tag, meta: meta || {} };
+    try {
+        observed = require('../services/automation-observability').observeAutomationLog(
+            process.env.FARM_ACCOUNT_ID || '', tag, msg, isWarn, meta || {});
+    } catch { /* Optional observation must never drop the original runtime log. */ }
     sendToMaster({
         type: 'log',
         data: {
             time: formatLocalDateTime24(new Date()),
-            tag,
+            tag: observed.tag,
             msg,
             isWarn,
-            meta: meta || {}
+            meta: observed.meta
         }
     });
 });
@@ -518,8 +523,6 @@ const STEAL_REDISCOVERY_MAX_MS = 8 * 60_000;
 // ponytail: 重点好友摘要刷新下限，60-120s 高斯抖动。请求代价是空闲期每下限
 // 一次 getAllFriends（全部好友共用一次请求）；要更快的催熟捕获就收紧这两个值，
 // 代价是更高请求密度（防封红线内已尽量取宽）。
-const PRIORITY_SUMMARY_FLOOR_MIN_MS = 60_000;
-const PRIORITY_SUMMARY_FLOOR_MAX_MS = 120_000;
 
 /**
  * 只有完全没有成熟墙钟时才低频重新发现。普通偷菜有已知时刻后直接等到点，
@@ -916,19 +919,7 @@ function armStealWake(now = Date.now()) {
         stealOverdueStrikes = 0;
         // 普通偷菜按成熟墙钟一次性到点唤醒；若 dueAt 来自 HOT/PREARM，
         // 它本身就是该目标下一次独立进门时刻，不需要全好友摘要轮询。
-        // 重点好友催熟兜底（2026-09-22）：催熟可从任意时刻直接立即可偷，
-        // 122 分钟观察窗与窗口外 5-8 分钟巡田都盖不住「窗口外催熟→秒偷」；
-        // 有重点好友挂未来成熟墙钟时加 60-120s 摘要刷新下限（一次
-        // getAllFriends 覆盖全部好友），瞬熟立即出现在摘要可偷列表走既有
-        // 抢收、普通施肥提前触发摘要跳变 HOT。真实到期更近时 min 自然取
-        // 真实值，HOT/PREARM 的更短到期不受影响。
-        const summaryFloorMs = watchlistDue > now
-            ? gaussianInt(PRIORITY_SUMMARY_FLOOR_MIN_MS, PRIORITY_SUMMARY_FLOOR_MAX_MS)
-            : 0;
-        nextStealRunAt = Math.min(
-            dueAt + randInt(30, 120),
-            summaryFloorMs > 0 ? now + summaryFloorMs : Number.POSITIVE_INFINITY
-        );
+        nextStealRunAt = dueAt + randInt(30, 120);
         markStealDueAt(dueAt);
         armMaturitySentinel(now);
         return;
@@ -1041,7 +1032,17 @@ async function runUnifiedTick() {
     const shouldHelp = now >= nextHelpRunAt;
     const shouldSteal = stealAt > 0 && now >= stealAt;
 
-    const shouldActivity = autoConfig.milk_tea_auto_rewards === true && now >= nextActivityRewardsAt(now);
+    // 任一奶茶自动化开关（免费领奖/购种/班次工作/升级）都可唤醒统一活动调度；
+    // 其余成熟/好友/HOT/治理/登录链不受这些开关影响。
+    const milkTeaAutoOn = autoConfig.milk_tea_auto_rewards === true
+        || autoConfig.milk_tea_auto_seeds === true
+        || autoConfig.milk_tea_auto_work === true
+        || autoConfig.milk_tea_auto_upgrade === true
+        || autoConfig.milk_tea_auto_craft === true
+        || autoConfig.milk_tea_auto_hire === true
+        || autoConfig.milk_tea_auto_open === true
+        || autoConfig.milk_tea_auto_boost === true;
+    const shouldActivity = milkTeaAutoOn && now >= nextActivityRewardsAt(now);
     if (!shouldFarm && !shouldHelp && !shouldSteal && !shouldActivity && !stealIsImminent(1500)) return;
 
     if (!autoConfig.friend_steal) {
@@ -1063,6 +1064,9 @@ async function runUnifiedTick() {
         await require('../services/milk-tea-activity').runAutomaticMilkTea({
             isReady: () => loginReady && !friendSyncPaused,
             canRun: () => !ownHarvestIsDue() && !ownHarvestIsImminent(OWN_HARVEST_RESERVE_MS) && !stealIsDue() && !stealIsImminent(1500),
+            // 真实仓库背包读取（购种预算/库存缺口依赖），非测试桩
+            getBag,
+            getBagItems,
         });
     }
 }
@@ -1143,12 +1147,20 @@ function stopUnifiedScheduler() {
 
 function applyRuntimeConfig(config, syncStatusAfter = false) {
     const prevAuto = getAutomation();
+    let automationObservation;
+    let observedConfig;
+    try {
+        automationObservation = require('../services/automation-observability');
+        observedConfig = automationObservation.snapshotAutomationConfig(prevAuto);
+    } catch { /* Configuration application does not depend on its status log. */ }
     const accountId = process.env.FARM_ACCOUNT_ID || '';
 
     applyConfigSnapshot(config || {}, {
         persist: false,
         accountId
     });
+    try { if (observedConfig) automationObservation.logAutomationConfigChanges(observedConfig, getAutomation()); }
+    catch { /* Keep the existing application and scheduling path. */ }
     if (getFriendQuietHours().idleProtectionEnabled !== true) setIdleProtectionUntil(0);
 
     // 配置侧意图 reconcile（2026-10-07 陈旧名单治理）：配置应用完成后、
@@ -1288,6 +1300,7 @@ async function stopBot() {
     networkEvents.off('kickout', onKickout);
     networkEvents.off('reconnect_failed', onReconnectFailed);
     networkEvents.off('friendLandsChanged', onFriendLandsChanged);
+    networkEvents.off('landsChanged', onOwnLandsPanelChanged);
     if (onClientVersionUpdate) {
         networkEvents.off('client_version_update', onClientVersionUpdate);
         onClientVersionUpdate = null;
@@ -1355,6 +1368,12 @@ function onReconnectFailed(info) {
 }
 
 /** 好友农场地块变化推送：检测催熟/施肥痕迹，触发盯梢并立即重排偷菜唤醒 */
+function onOwnLandsPanelChanged(lands) {
+    // The host already attributes this event to our own farm. Invalidate only;
+    // do not start a read, wake automation, or treat a partial notify as a full list.
+    if (Array.isArray(lands) && lands.length > 0) require('../services/farm-land-analyzer').invalidatePanelLandsCache();
+}
+
 function onFriendLandsChanged(info) {
     const hostGid = toNum(info && info.hostGid);
     const lands = info && info.lands;
@@ -1436,7 +1455,7 @@ function collectPetDiaryErrorMeta(err) {
     if (!err || err.business !== true) return null;
     const code = err.code;
     if (typeof code !== 'string' || !PET_DIARY_ERROR_CODE_RE.test(code)) return null;
-    return { business: true, code };
+    return { business: true, code, ...(['list', 'group', 'precondition', 'write'].includes(err.milkTeaStage) ? { stage: err.milkTeaStage } : {}) };
 }
 
 /**
@@ -1510,7 +1529,8 @@ async function handleApiCall(msg) {
     let error = null;
     let errorMeta = null;
 
-    if (FRIEND_PANEL_ENTRY_METHODS.has(method) || BAG_PANEL_ENTRY_METHODS.has(method) || method === 'getOfficialAnnouncements') {
+    if (FRIEND_PANEL_ENTRY_METHODS.has(method) || BAG_PANEL_ENTRY_METHODS.has(method) || method === 'getOfficialAnnouncements'
+        || method === 'getEmailSnapshot' || method === 'getGameUpdateEvidence') {
         const ws = getWs();
         if (!isRunning || !loginReady || !ws || ws.readyState !== 1) {
             sendToMaster({
@@ -1537,6 +1557,20 @@ async function handleApiCall(msg) {
 
     try {
         switch (method) {
+            case 'getDogReadPanel':
+                result = await require('../services/game-panel-readonly').getDogReadPanel();
+                break;
+            case 'getCollectionReadPanel':
+                result = await require('../services/game-panel-readonly').getCollectionReadPanel();
+                break;
+            case 'getLocalConnectionState': {
+                const socket = getWs();
+                const state = socket?.readyState === 1 ? 'online'
+                    : socket?.readyState === 3 || (!socket && isRunning === false && loginReady === false) ? 'offline' : 'unknown';
+                result = { state, connected: state === 'online' ? true : state === 'offline' ? false : undefined,
+                    businessReady: state === 'online' && isRunning === true && loginReady === true };
+                break;
+            }
             case 'getLands':
                 result = await require('../services/farm-land-analyzer').getLandsDetailForPanel();
                 break;
@@ -1622,19 +1656,26 @@ async function handleApiCall(msg) {
             case 'useItem': {
                 const { useItem } = require('../services/warehouse');
                 const itemId = Number(args[0]) || 0;
-                const count = Math.max(1, Number(args[1]) || 1);
-                const uid = Number(args[2]) || 0;
+                const count = args[1] ?? 1;
+                const uid = args[2] ?? 0;
                 result = await useItem(itemId, count, uid);
                 break;
             }
             case 'sellItems': {
-                const { sellItems } = require('../services/warehouse');
-                const items = Array.isArray(args[0]) ? args[0] : [];
-                const totalCount = items.reduce((sum, it) => sum + (Number(it.count) || 0), 0);
-                result = await sellItems(items.map(it => ({
-                    id: it.id, count: it.count, uid: it.uid || 0
-                })));
-                if (totalCount > 0) recordOperation('sell', totalCount);
+                // 面板手动出售（对象载荷）走唯一写守护；旧数组载荷保持原行为
+                // （自动出售链路不经此 case）。
+                if (args[0] && !Array.isArray(args[0]) && typeof args[0] === 'object') {
+                    const { guardedBagSale } = require('../services/manual-commerce');
+                    result = await guardedBagSale(args[0]);
+                } else {
+                    const { sellItems } = require('../services/warehouse');
+                    const items = Array.isArray(args[0]) ? args[0] : [];
+                    const totalCount = items.reduce((sum, it) => sum + (Number(it.count) || 0), 0);
+                    result = await sellItems(items.map(it => ({
+                        id: it.id, count: it.count, uid: it.uid || 0
+                    })));
+                    if (totalCount > 0) recordOperation('sell', totalCount);
+                }
                 break;
             }
             case 'setAutomation': {
@@ -1669,13 +1710,20 @@ async function handleApiCall(msg) {
                 break;
             }
             case 'getShopInfo': {
-                const { getShopInfo } = require('../services/farm');
-                result = await getShopInfo(args[0]);
+                const { getRegularShopForPanel } = require('../services/mall');
+                result = await getRegularShopForPanel(args[0]);
                 break;
             }
             case 'buyGoods': {
-                const { buyGoods } = require('../services/farm');
-                result = await buyGoods(args[0], args[1], args[2]);
+                // 面板手动购买（对象载荷 {shopKind, goodsId, count, quoteFingerprint}）
+                // 走唯一写守护；旧三元组载荷（图鉴购买等既有链路）保持原行为。
+                if (args[0] && !Array.isArray(args[0]) && typeof args[0] === 'object') {
+                    const { guardedShopPurchase } = require('../services/manual-commerce');
+                    result = await guardedShopPurchase(args[0]);
+                } else {
+                    const { buyGoods } = require('../services/farm');
+                    result = await buyGoods(args[0], args[1], args[2]);
+                }
                 break;
             }
             case 'getMallGoods': {
@@ -1683,9 +1731,28 @@ async function handleApiCall(msg) {
                 result = await getMallGoodsList(0);
                 break;
             }
+            case 'getMallCatalog': {
+                // 面板商城目录：60s 缓存 + 在途合并 + 失败冷却（写成功后失效）。
+                const { getMallCatalogForPanel } = require('../services/mall');
+                result = await getMallCatalogForPanel();
+                break;
+            }
+            case 'getMonthCardPanel': {
+                // 面板月卡只读视图：首次选月卡分区才读，60s 缓存 + 合并，不轮询。
+                const { getMonthCardPanelInfos } = require('../services/monthcard');
+                result = await getMonthCardPanelInfos();
+                break;
+            }
             case 'buyMallGoods': {
-                const { purchaseMallGoods } = require('../services/mall');
-                result = await purchaseMallGoods(args[0], args[1]);
+                // 面板手动购买（对象载荷 {goodsId, count, quoteFingerprint}）走
+                // 唯一写守护；旧二元组载荷保持原直购行为。
+                if (args[0] && !Array.isArray(args[0]) && typeof args[0] === 'object') {
+                    const { guardedMallPurchase } = require('../services/manual-commerce');
+                    result = await guardedMallPurchase(args[0]);
+                } else {
+                    const { purchaseMallGoods } = require('../services/mall');
+                    result = await purchaseMallGoods(args[0], args[1]);
+                }
                 break;
             }
             case 'getMysteryShop': {
@@ -1713,6 +1780,18 @@ async function handleApiCall(msg) {
             case 'getOfficialAnnouncements': {
                 const { getOfficialAnnouncements } = require('../services/official-announcements');
                 result = await getOfficialAnnouncements();
+                break;
+            }
+            case 'getEmailSnapshot': {
+                // 只读双箱快照：60s 缓存 + 在途合并，面板刷新不穿透腾讯；无领取动作。
+                const { getEmailSnapshot } = require('../services/email');
+                result = await getEmailSnapshot(args[0] || {});
+                break;
+            }
+            case 'getGameUpdateEvidence': {
+                // 一次有界更新证据采集：公告/邮件/节日/任务/图鉴/商城各一次，只读。
+                const { collectGameUpdateEvidence } = require('../services/game-update-evidence');
+                result = await collectGameUpdateEvidence(args[0] || {});
                 break;
             }
             case 'getActivityGroupSnapshot': {
@@ -1842,7 +1921,11 @@ async function handleApiCall(msg) {
         }
     } catch (err) {
         error = err.message;
-        errorMeta = collectPetDiaryErrorMeta(err);
+        // 业务码元数据优先；否则尝试严格预算拒绝元数据（governed/stage，
+        // 2026-10-30 奶茶 502 定位修复），二者按白名单互斥、附加属性不回传。
+        errorMeta = collectPetDiaryErrorMeta(err)
+            || (['getMilkTeaActivity', 'queryMilkTeaActivity', 'operateMilkTea'].includes(method)
+                ? require('../services/operation-error-meta').collectOperationErrorMeta(err) : null);
     }
 
     if (isFriendSync) {
@@ -2086,6 +2169,11 @@ function bindWorkerReadyEvents() {
     // 收获后自动出售
     if (onFarmHarvested) networkEvents.off('farmHarvested', onFarmHarvested);
     onFarmHarvested = async (event = {}) => {
+        // Local dirty flag only: the existing activity scheduler merges a wake
+        // at least 60s later. Never craft inside the harvest/priority chain.
+        if (getAutomation().milk_tea_auto_craft === true) {
+            try { require('../services/milk-tea-activity').markMilkTeaMaterialsDirty(); } catch { /* harvest remains independent */ }
+        }
         if (event.quietPriority || pauseRemainMsNow() > 0) { deferOwnHarvestSale(); return; }
         if (harvestSellRunning) return;
         if (!getAutomation().sell) return;
@@ -2212,6 +2300,8 @@ function bindWorkerNetworkEvents() {
     networkEvents.on('reconnect_failed', onReconnectFailed);
     networkEvents.on('kickout', onKickout);
     networkEvents.on('friendLandsChanged', onFriendLandsChanged);
+    networkEvents.off('landsChanged', onOwnLandsPanelChanged);
+    networkEvents.on('landsChanged', onOwnLandsPanelChanged);
 
     if (onClientVersionUpdate) networkEvents.off('client_version_update', onClientVersionUpdate);
     onClientVersionUpdate = ({ clientVersion, previous }) => {
@@ -2345,6 +2435,8 @@ if (globalThis.process?.env?.FARM_SESSION_BUSINESS === '1') {
     onSentinelPreEnterTimer = require('../services/business-state').wrapBusinessFunction('worker:sentinelPreEnter', onSentinelPreEnterTimer);
     module.exports.sessionRuntime = {
         refreshRewardsSchedule: () => {
+            // Active rewardSchedule scope, never the checkpoint preparation gate.
+            require('../services/fertilizer-watch').retireFertilizerWatchMode();
             if (unifiedSchedulerRunning) {
                 // A warm checkpoint may contain the former quiet-until harvest timer.
                 // Re-arm from the preserved crop deadline under the current priority policy.

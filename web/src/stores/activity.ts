@@ -619,7 +619,7 @@ export interface MilkTeaItem { id: number, count?: string | number, name?: strin
 export interface MilkTeaShareReward {
   currentScore?: number
   daily?: { rewardClaimed?: boolean, firstShareAwarded?: boolean, claimedCount?: number, claimLimit?: number }
-  milestones?: Array<{ id?: number, threshold?: number, state?: number, rewards?: Array<{ itemId?: number, itemCount?: number, itemName?: string, image?: string }> }>
+  milestones?: Array<{ id?: number, threshold?: number, state?: number, rewards?: Array<{ itemId?: number, itemCount?: number, itemName?: string, image?: string, description?: string }> }>
 }
 export interface MilkTeaExchangeBounds {
   requestMax: number
@@ -631,6 +631,28 @@ export interface MilkTeaExchangeBounds {
   blockReason: string
   unitCosts: Array<{ itemId: number, count: string, name: string }>
 }
+export interface MilkTeaAutomationStatus {
+  unavailable?: boolean
+  lastMessage?: string
+  rewardsEnabled?: boolean
+  seedsEnabled?: boolean
+  workEnabled?: boolean
+  upgradeEnabled?: boolean
+  craftEnabled?: boolean
+  hireEnabled?: boolean
+  openEnabled?: boolean
+  boostEnabled?: boolean
+  hirePolicy?: { durationId: number, ticketDailyLimit: string, ticketReserve: string }
+  reservedFruitStacks?: number
+  pendingHires?: number
+  familyReasons?: Record<string, string>
+  seedReasons?: { name: string, reason: string }[]
+  nextCheckAt?: number
+  pendingPurchases?: number
+  pendingInteractions?: number
+  wagesPending?: boolean
+  upgradePending?: boolean
+}
 export interface MilkTeaActivityData {
   activityId?: number
   title?: string
@@ -638,9 +660,11 @@ export interface MilkTeaActivityData {
   rules?: string[]
   summary?: { shopOpenAt?: number, shopName?: string, level?: number, totalRevenue?: number, canUpgrade?: boolean, hireDisabled?: boolean, hasUnclaimedWage?: boolean }
   inventory?: { available?: boolean, ticketCount?: number, boostItemCount?: number }
-  exchangeShop?: { items?: Array<{ id: number, name?: string, rewards?: MilkTeaItem[], costs?: MilkTeaItem[], purchaseLimit?: number, purchasedCount?: number, diamondCostCount?: number, exchangeBounds?: MilkTeaExchangeBounds }> }
+  exchangeShop?: { items?: Array<{ id: number, name?: string, rewards?: MilkTeaItem[], costs?: MilkTeaItem[], purchaseLimit?: number, purchaseLimitKnown?: boolean, purchasedCountKnown?: boolean, purchasedCount?: number, diamondCostCount?: number, exchangeBounds?: MilkTeaExchangeBounds }> }
   growthFund?: { unlocked?: boolean, tiers?: Array<{ tierId?: number, state?: number, conditions?: Array<{ reached?: boolean }>, reward?: MilkTeaItem[] }> }
+  happyShareUpdate?: { notice: string, giftTiersAvailable: boolean, gifts: Array<{ id: number, name: string, platform: string, description: string, image?: string }> }
   shareReward?: MilkTeaShareReward
+  automationStatus?: MilkTeaAutomationStatus | null
   gameplay?: Partial<Record<'shop' | 'workshop' | 'work', {
     available: boolean
     data: Record<string, any> | null
@@ -652,6 +676,73 @@ export type MilkTeaQueryKind = 'shop' | 'hireList' | 'workshop' | 'work' | 'rank
 export interface MilkTeaQueryState { data: Record<string, any> | null, loading: boolean, error: string }
 
 export const useActivityStore = defineStore('activity', () => {
+  type UpdateKind = 'evidence' | 'emails' | 'catalog' | 'dog' | 'collections'
+  const updateReads = ref<Record<UpdateKind, { data: any, loading: boolean, error: string }>>({
+    evidence: { data: null, loading: false, error: '' }, emails: { data: null, loading: false, error: '' }, catalog: { data: null, loading: false, error: '' },
+    dog: { data: null, loading: false, error: '' }, collections: { data: null, loading: false, error: '' },
+  })
+  const updateSeq: Record<UpdateKind, number> = { evidence: 0, emails: 0, catalog: 0, dog: 0, collections: 0 }
+  function cancelUpdateReads(clear = false) {
+    for (const key of ['evidence', 'emails', 'catalog', 'dog', 'collections'] as UpdateKind[]) {
+      ++updateSeq[key]
+      updateReads.value[key].loading = false
+      if (clear)
+        updateReads.value[key] = { data: null, loading: false, error: '' }
+    }
+  }
+  async function loadUpdate(kind: UpdateKind, accountId: string) {
+    if (!accountId || !isCurrentAccount(accountId) || updateReads.value[kind].loading)
+      return { ok: false, cancelled: true }
+    const seq = ++updateSeq[kind]
+    const current = () => seq === updateSeq[kind] && isCurrentAccount(accountId)
+    updateReads.value[kind].loading = true
+    updateReads.value[kind].error = ''
+    const endpoint = { evidence: 'game-update-evidence', emails: 'emails', catalog: 'game-update-catalog', dog: 'dog-state', collections: 'collection-state' }[kind]
+    try {
+      const { data } = await api.get(`/api/activity/${endpoint}`, { headers: { 'x-account-id': accountId }, timeout: 120000 })
+      if (!current())
+        return { ok: false, cancelled: true }
+      if (data?.ok !== true)
+        throw new Error(data?.error || '读取失败，请稍后刷新')
+      const value = data[{ evidence: 'evidence', emails: 'snapshot', catalog: 'catalog', dog: 'state', collections: 'state' }[kind]]
+      if (!value || typeof value !== 'object')
+        throw new Error('状态不完整，请稍后刷新')
+      if (kind === 'catalog' && (!Array.isArray(value.series) || !Array.isArray(value.scores) || !Array.isArray(value.milestones)
+        || value.series.some((group: any) => typeof group?.name !== 'string' || !Array.isArray(group.items) || !Array.isArray(group.stars)
+          || group.items.some((item: any) => typeof item?.name !== 'string'))
+        || value.scores.some((row: any) => !row || !Array.isArray(row.scores))
+        || value.milestones.some((row: any) => !row || !Array.isArray(row.buffs))))
+        throw new Error('目录状态不完整，请稍后刷新')
+      if (kind === 'emails' && (!value.boxes || typeof value.boxes !== 'object'))
+        throw new Error('邮箱状态不完整，请稍后刷新')
+      if (kind === 'evidence' && (!value.sources || typeof value.sources !== 'object' || Array.isArray(value.sources)
+        || Object.values(value.sources).some(source => !source || typeof source !== 'object')))
+        throw new Error('动态状态不完整，请稍后刷新')
+      const isCount = (count: unknown) => typeof count === 'string' && /^(?:0|[1-9][0-9]*)$/.test(count)
+      if (kind === 'dog' && (!Array.isArray(value.dogs) || !Array.isArray(value.foods) || typeof value.currentDogName !== 'string'
+        || typeof value.foodInventoryKnown !== 'boolean' || !isCount(value.pendingGiftCountDec) || value.feedingEnabled !== false
+        || value.foods.some((food: any) => !food || typeof food.name !== 'string' || !isCount(food.countDec))))
+        throw new Error('守卫犬状态不完整，请稍后刷新')
+      if (kind === 'collections' && (!Array.isArray(value.items) || !Array.isArray(value.displays) || !Number.isInteger(value.currentScore)
+        || !Number.isInteger(value.claimedScore) || value.writesEnabled !== false
+        || value.items.some((item: any) => !item || typeof item.name !== 'string' || !Number.isInteger(item.star) || item.star < 0 || item.star > 5 || !isCount(item.ownedCountDec))
+        || value.displays.some((slot: any) => !slot || !Number.isInteger(slot.slotType) || typeof slot.name !== 'string')))
+        throw new Error('珍藏室状态不完整，请稍后刷新')
+      updateReads.value[kind].data = value
+      return { ok: true }
+    }
+    catch (error: any) {
+      if (!current())
+        return { ok: false, cancelled: true }
+      updateReads.value[kind].error = String(error?.message || '读取失败')
+      return { ok: false }
+    }
+    finally {
+      if (current())
+        updateReads.value[kind].loading = false
+    }
+  }
+
   // ===== 奶茶热销中（S4，2026110100 族）=====
   // 旧 S3 萌宠 / 秋祈良愿 / 快乐不独享已随 S4 轮换整链退役（路由不再注册、
   // provider/Worker 转发移除）；本 store 只保留类型导出供历史组件编译，
@@ -795,6 +886,7 @@ export const useActivityStore = defineStore('activity', () => {
    * 有效快照重排计时）。
    */
   function cancelActivityReads() {
+    cancelUpdateReads()
     ++activityLifecycleSeq
     ++milkTeaOperateSeq
     milkTeaOperating.value = ''
@@ -835,6 +927,7 @@ export const useActivityStore = defineStore('activity', () => {
   }
 
   function clearActivityData() {
+    cancelUpdateReads(true)
     ++activityLifecycleSeq
     ++milkTeaRequestId
     // 账号切换：下架证据与到期计时属于旧账号，一并清掉（豁免通道与快照照旧清空）
@@ -1234,6 +1327,7 @@ export const useActivityStore = defineStore('activity', () => {
   }
 
   return {
+    updateReads, loadUpdate, cancelUpdateReads,
     milkTeaActivity,
     milkTeaLoading,
     milkTeaError,
