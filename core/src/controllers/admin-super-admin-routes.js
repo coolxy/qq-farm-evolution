@@ -9,29 +9,48 @@ function registerAdminSuperAdminRoutes({
   checkAccountLimit,
 }) {
   const updater = require('../services/program-update');
-  app.get('/api/super-admin/investigations', requireAdminToken, requireSuperAdminRole, (_req, res) => {
+  const requireStatusViewer = (req, res, next) => {
+    if (!['admin', 'super_admin'].includes(req.currentUser?.role)) return res.status(403).json({ ok: false, error: '需要管理员权限' });
+    next();
+  };
+  // Program-update rejections expose only this fixed whitelist: a stable reason
+  // code plus actionable guidance. The caught error is a lookup key and nothing
+  // else; raw messages, paths, addresses and request data never reach the
+  // response body or the log record.
+  const UPDATE_FAILURES = new Map([
+    ['check_update_first', '请先点击“检查新版本”确认有可用更新，再安装。'],
+    ['evolution_busy', '有自动化任务尚未结束，请等任务结束后再手动安装更新。'],
+    ['update_busy', '已有一次更新正在进行，请等待本次更新完成。'],
+    ['update_requires_existing_tmux', '无法确认程序所在的原 tmux 窗格，已停止自动更新；请保持当前服务运行，按原部署方式更新，不要另开新实例。'],
+    ['untrusted_update_source', '程序来源不在受信任名单内，已停止自动更新；请核对当前部署的来源仓库。'],
+    ['remote_unreadable', '暂时无法读取上游版本信息，请检查当前部署的 Git 访问后，再手动检查新版本。'],
+    ['unknown', '无法确认本次操作结果，请保留当前服务，先刷新状态并查看本机日志，不要重复安装。'],
+  ]);
+  const rejectUpdateAction = (res, action, error) => {
+    let reason = 'unknown';
     try {
-      const dataDir = require('../config/runtime-paths').getDataDir();
-      const { pending } = require('../services/evolution-no-change-audit').getInvestigationFollowups(dataDir);
-      res.json({ ok: true, investigations: pending.map(entry => ({ id: entry.id, area: entry.area,
-        question: String(entry.question || '').slice(0, 2000), missing: String(entry.lastReview?.remaining ?? entry.missing ?? '').slice(0, 2000),
-        ruledOut: (entry.ruledOut || []).slice(0, 8), nextCheckAt: entry.nextCheckAt,
-        lastCheckedAt: entry.lastReview?.reviewedAt || 0, conclusion: String(entry.lastReview?.conclusion || '').slice(0, 2000),
-        verification: entry.lastReview?.verification || null, needsOwner: entry.mechanism === 'owner_evidence' })) });
-    } catch { res.status(500).json({ ok: false, error: '调查记录暂时不可读' }); }
-  });
-  app.get('/api/super-admin/program-update', requireAdminToken, requireSuperAdminRole, (_req, res) => {
-    try { res.json({ ok: true, update: updater.safeState() }); }
-    catch { res.status(500).json({ ok: false, error: '无法读取版本更新状态' }); }
-  });
-  app.post('/api/super-admin/program-update/check', requireAdminToken, requireSuperAdminRole, async (_req, res) => {
-    try { res.json({ ok: true, update: await updater.check() }); }
-    catch { res.status(409).json({ ok: false, error: '版本检查失败，请检查可信来源与网络连接' }); }
-  });
-  app.post('/api/super-admin/program-update/install', requireAdminToken, requireSuperAdminRole, (_req, res) => {
-    try { res.json({ ok: true, update: updater.begin() }); }
-    catch { res.status(409).json({ ok: false, error: '暂不能更新，请先检查新版本并等待进化或更新任务结束' }); }
-  });
+      const message = error?.message;
+      if (typeof message === 'string' && UPDATE_FAILURES.has(message)) reason = message;
+    } catch { /* Even a malformed exception must use the fixed fallback. */ }
+    try {
+      logger?.warn('程序更新请求处理失败', { module: 'program-update', event: 'update_action_failed', action, failureReason: reason });
+    } catch { /* A broken or absent log sink must not change the HTTP result. */ }
+    res.status(409).json({ ok: false, reason, error: UPDATE_FAILURES.get(reason) });
+  };
+  for (const prefix of ['/api/admin/program-update', '/api/super-admin/program-update']) {
+    app.get(prefix, requireAdminToken, requireStatusViewer, (_req, res) => {
+      try { res.json({ ok: true, update: updater.publicState(), access: { canUpdate: true } }); }
+      catch { res.status(500).json({ ok: false, error: '无法读取版本更新状态' }); }
+    });
+    app.post(`${prefix}/check`, requireAdminToken, requireStatusViewer, async (_req, res) => {
+      try { res.json({ ok: true, update: updater.publicState({ state: await updater.check() }) }); }
+      catch (error) { rejectUpdateAction(res, 'check', error); }
+    });
+    app.post(`${prefix}/install`, requireAdminToken, requireStatusViewer, (_req, res) => {
+      try { res.json({ ok: true, update: updater.publicState({ state: updater.begin() }) }); }
+      catch (error) { rejectUpdateAction(res, 'install', error); }
+    });
+  }
   app.post(
     "/api/super-admin/clear-data",
     requireAdminToken,

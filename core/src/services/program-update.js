@@ -10,9 +10,11 @@ const { getDataDir } = require('../config/runtime-paths');
 const pub = require('./evolution-publish');
 const validation = require('./evolution-validation');
 const { resolveKnowledgeDir } = require('./evolution-knowledge');
+const versions = require('./program-version');
 const ROOT = path.resolve(__dirname, '../../..');
 const STATE = 'program-update.json';
 const LOCK = 'program-update-lock';
+const checks = new Map();
 const ACTIVE = new Set(['queued', 'fetching', 'dependencies', 'validating', 'overlay', 'preparing', 'applying']);
 const sha = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 const read = file => JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -57,7 +59,11 @@ function busyEvolution(dataDir) {
     } catch (error) { if (error.code === 'ENOENT') return false; throw error; }
 }
 function paneFor(pid) {
-    const lines = cp.execFileSync('tmux', ['list-panes', '-a', '-F', '#{pane_id} #{pane_pid}'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    let lines;
+    // A deployment whose tmux cannot even be queried is not confirmable; report
+    // the stable reason instead of the raw spawn error.
+    try { lines = cp.execFileSync('tmux', ['list-panes', '-a', '-F', '#{pane_id} #{pane_pid}'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); }
+    catch { throw new Error('update_requires_existing_tmux'); }
     for (const line of lines.trim().split('\n')) {
         const [pane, ancestor] = line.split(/\s+/); let at = pid;
         for (let n = 0; at > 1 && n < 64; n++) {
@@ -67,7 +73,7 @@ function paneFor(pid) {
     }
     throw new Error('update_requires_existing_tmux');
 }
-function safeState(dataDir = getDataDir()) {
+function safeState(dataDir = getDataDir(), root = ROOT) {
     let s;
     try { s = read(path.join(dataDir, STATE)); } catch (e) { if (e.code !== 'ENOENT') throw e; s = { phase: 'idle' }; }
     const helperAlive = s.workerHost === os.hostname() && identityLive(s.helperPid, s.helperStarttime);
@@ -89,7 +95,7 @@ function safeState(dataDir = getDataDir()) {
                 s = { ...s, phase: 'applied', currentCommit: s.targetCommit, connectionPreserved: true, reason: '更新完成，已核对本轮正式回执', updatedAt: Date.now() };
                 put(path.join(dataDir, STATE), s);
                 if (lockHeld(dataDir) && read(path.join(dataDir, LOCK, 'owner.json')).runId === s.runId) release(dataDir, s.runId);
-                return safeState(dataDir);
+                return safeState(dataDir, root);
             }
         } catch { /* An absent/mismatched receipt cannot prove success. */ }
         // Never trust a previous ready receipt or restart an interrupted update.
@@ -97,8 +103,14 @@ function safeState(dataDir = getDataDir()) {
         put(path.join(dataDir, STATE), s);
         if (lockHeld(dataDir) && read(path.join(dataDir, LOCK, 'owner.json')).runId === s.runId) release(dataDir, s.runId);
     }
-    return { phase: s.phase, runId: s.runId || '', currentCommit: s.currentCommit || currentCommit(), targetCommit: s.targetCommit || '',
-        updatedAt: s.updatedAt || 0, reason: s.reason || '', connectionPreserved: s.connectionPreserved === true, source: 'origin/main' };
+    let running;
+    try { running = currentCommit(root); }
+    catch { return { phase: 'unavailable', currentCommit: '', targetCommit: '', source: 'origin/main', reason: '当前部署没有可读取的 Git 版本，请按现有部署方式更新。' }; }
+    // Historical checks/transactions keep their original baseline on disk. The
+    // status shown to a user always describes this actual running source root.
+    const staleCheck = ['idle', 'current', 'available', 'applied'].includes(s.phase) && s.currentCommit && s.currentCommit !== running;
+    return { phase: staleCheck ? 'idle' : s.phase, runId: s.runId || '', currentCommit: running, targetCommit: staleCheck ? '' : s.targetCommit || '',
+        updatedAt: staleCheck ? 0 : s.updatedAt || 0, latestVersion: staleCheck ? null : s.latestVersion || null, reason: staleCheck ? '程序版本已变化，请重新检查上游新版本。' : s.reason || '', connectionPreserved: s.connectionPreserved === true, source: 'origin/main' };
 }
 function currentCommit(root = ROOT) { return cp.execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim(); }
 function remoteHeadAsync(root) {
@@ -109,21 +121,46 @@ function remoteHeadAsync(root) {
             else resolve(commit);
         }));
 }
-async function check({ root = ROOT, dataDir = getDataDir(), readRemoteHead = remoteHeadAsync } = {}) {
+async function check({ root = ROOT, dataDir = getDataDir(), readRemoteHead = remoteHeadAsync, readTargetVersion = versions.targetVersion } = {}) {
     assertTrustedOrigin(root);
-    const status = safeState(dataDir);
+    const status = safeState(dataDir, root);
     if (ACTIVE.has(status.phase)) return status;
-    const targetCommit = await readRemoteHead(root);
-    const latest = safeState(dataDir);
-    if (ACTIVE.has(latest.phase)) return latest;
-    const s = { phase: targetCommit === currentCommit(root) ? 'current' : 'available', currentCommit: currentCommit(root), targetCommit, updatedAt: Date.now() };
-    put(path.join(dataDir, STATE), s);
-    return safeState(dataDir);
+    const key = path.resolve(dataDir);
+    const token = Symbol('check'); checks.set(key, token);
+    const snapshot = () => { try { return fs.readFileSync(path.join(dataDir, STATE), 'utf8'); } catch (error) { if (error.code === 'ENOENT') return null; throw error; } };
+    const original = snapshot();
+    const changed = () => checks.get(key) !== token || snapshot() !== original;
+    try {
+        const targetCommit = await readRemoteHead(root);
+        if (changed()) return safeState(dataDir, root);
+        const latestVersion = await readTargetVersion(root, targetCommit);
+        versions.parseVersion(JSON.stringify({ version: latestVersion }));
+        if (changed()) return safeState(dataDir, root);
+        const s = { phase: targetCommit === currentCommit(root) ? 'current' : 'available', currentCommit: currentCommit(root), targetCommit, latestVersion, updatedAt: Date.now() };
+        put(path.join(dataDir, STATE), s);
+        return safeState(dataDir, root);
+    } finally { if (checks.get(key) === token) checks.delete(key); }
+}
+function publicState({ dataDir = getDataDir(), root = ROOT, state } = {}) {
+    const status = state || safeState(dataDir, root);
+    const currentVersion = versions.installedVersion(root);
+    let latestVersion = null;
+    try { latestVersion = versions.parseVersion(JSON.stringify({ version: status.latestVersion })); } catch {}
+    const messages = { current: '已是最新版本', applied: '更新完成', failed: '更新未完成，请查看运行日志后重试。',
+        interrupted: '更新已中断，请重新检查。', unavailable: '当前部署方式不支持后台更新，请按原部署方式更新。' };
+    return { phase: currentVersion ? status.phase : 'unavailable', currentVersion,
+        latestVersion,
+        updateAvailable: !!currentVersion && !!latestVersion && status.phase === 'available' && !!status.targetCommit && status.targetCommit !== status.currentCommit,
+        updatedAt: status.updatedAt || 0, message: currentVersion ? messages[status.phase] || '' : messages.unavailable };
 }
 function begin({ root = ROOT, dataDir = getDataDir(), spawn = cp.spawn, resolvePane = paneFor } = {}) {
-    assertTrustedOrigin(root); safeState(dataDir);
-    const previous = read(path.join(dataDir, STATE));
-    if (previous.phase !== 'available') throw new Error('check_update_first');
+    assertTrustedOrigin(root); safeState(dataDir, root);
+    let previous;
+    try { previous = read(path.join(dataDir, STATE)); }
+    catch (error) { if (error.code === 'ENOENT') throw new Error('check_update_first'); throw error; }
+    let versionReady = false;
+    try { versionReady = !!versions.parseVersion(JSON.stringify({ version: previous.latestVersion })); } catch {}
+    if (!versionReady || previous.phase !== 'available' || previous.currentCommit !== currentCommit(root)) throw new Error('check_update_first');
     const runId = `program-${Date.now()}-${crypto.randomUUID()}`;
     acquire(dataDir, runId);
     try {
@@ -152,7 +189,7 @@ function begin({ root = ROOT, dataDir = getDataDir(), spawn = cp.spawn, resolveP
         child.once('error', failQueued);
         child.once('exit', failQueued);
         child.unref();
-        return safeState(dataDir);
+        return safeState(dataDir, root);
     } catch (error) { release(dataDir, runId); throw error; }
 }
 function offlineEnv(env = process.env) {
@@ -293,4 +330,4 @@ function restoreSharedProof(dataDir, state) {
         else put(path.join(dataDir, name), JSON.parse(previous[name]));
     }
 }
-module.exports = { validationEnv, offlineEnv, restoreSharedProof, check, begin, safeState, runWorker, lockHeld, assertTrustedOrigin, assertCandidate, starttime, put, read, makeExecutor, linkDependencies };
+module.exports = { publicState, validationEnv, offlineEnv, restoreSharedProof, check, begin, safeState, runWorker, lockHeld, assertTrustedOrigin, assertCandidate, starttime, put, read, makeExecutor, linkDependencies };
